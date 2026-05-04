@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Seedance 接口原理</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="guide-shell">
+      <header class="guide-hero">
+        <nav class="guide-nav">
+          <a class="ghost-link" href="/">生成控制台</a>
+          <span id="guideRuntime">读取配置中...</span>
+        </nav>
+        <div class="guide-title">
+          <h1>Seedance 视频生成接口原理</h1>
+          <p>
+            这个本地站点把浏览器请求先送到 Node 后端，再由后端携带 API key 调用
+            New API。视频生成不是同步返回视频文件，而是先创建任务，再轮询任务状态。
+          </p>
+        </div>
+      </header>
+
+      <section class="flow-card">
+        <h2>请求链路</h2>
+        <div class="flow-map" aria-label="请求链路">
+          <div class="flow-node">
+            <strong>浏览器</strong>
+            <span>填写提示词、图片、时长、画幅</span>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node">
+            <strong>本地后端</strong>
+            <span>POST /api/videos</span>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node">
+            <strong>New API</strong>
+            <span>POST /v1/video/generations</span>
+          </div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-node">
+            <strong>异步任务</strong>
+            <span>返回 task_id，随后查询状态</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="guide-grid">
+        <article class="explain-card">
+          <h2>本地后端做了什么</h2>
+          <p>
+            前端不会直接访问模型供应商，也不会拿到 API key。浏览器只请求本地
+            Express 服务，后端再把请求转发到配置的 base URL。
+          </p>
+          <pre><code>POST http://localhost:1234/api/videos
+GET  http://localhost:1234/api/videos/{taskId}
+POST http://localhost:1234/api/config</code></pre>
+        </article>
+
+        <article class="explain-card">
+          <h2>上游接口怎么请求</h2>
+          <p>
+            当前项目适配的是 New API 网关的视频生成接口。鉴权放在后端请求头里：
+          </p>
+          <pre><code>POST {NEWAPI_BASE_URL}/v1/video/generations
+Authorization: Bearer $NEWAPI_API_KEY
+Content-Type: application/json</code></pre>
+        </article>
+
+        <article class="explain-card">
+          <h2>文生视频参数</h2>
+          <p>文生视频的最小输入是模型和提示词，其他参数用于控制输出规格。</p>
+          <pre><code>{
+  "model": "seedance-2.0-720p",
+  "prompt": "清晨池塘上的纸船，电影感镜头推进",
+  "duration": 5,
+  "width": 1280,
+  "height": 720,
+  "metadata": {
+    "ratio": "16:9",
+    "resolution": "720p",
+    "watermark": false
+  }
+}</code></pre>
+        </article>
+
+        <article class="explain-card">
+          <h2>图生视频参数</h2>
+          <p>
+            图生视频比文生视频多一个图片输入。这个项目支持图片 URL，也支持把本地图片转成
+            data URL 后交给后端。
+          </p>
+          <pre><code>{
+  "model": "seedance-2.0-720p",
+  "prompt": "让画面产生轻微运镜，人物自然眨眼",
+  "image": "https://example.com/image.jpg",
+  "duration": 5,
+  "metadata": {
+    "ratio": "16:9",
+    "resolution": "720p"
+  }
+}</code></pre>
+        </article>
+      </section>
+
+      <section class="matrix-section">
+        <h2>核心参数</h2>
+        <div class="param-table">
+          <div class="param-row heading">
+            <span>参数</span>
+            <span>作用</span>
+            <span>当前默认值</span>
+          </div>
+          <div class="param-row">
+            <span>model</span>
+            <span>选择视频模型或网关里的模型 ID。</span>
+            <span>seedance-2.0-720p</span>
+          </div>
+          <div class="param-row">
+            <span>prompt</span>
+            <span>描述视频内容、镜头运动、风格和限制。</span>
+            <span>用户输入</span>
+          </div>
+          <div class="param-row">
+            <span>image</span>
+            <span>图生视频的参考首帧或参考图。</span>
+            <span>图生视频必填</span>
+          </div>
+          <div class="param-row">
+            <span>duration</span>
+            <span>视频时长，单位秒；成本和等待时间会随之增加。</span>
+            <span>5</span>
+          </div>
+          <div class="param-row">
+            <span>ratio / width / height</span>
+            <span>控制横屏、竖屏或方图输出。</span>
+            <span>16:9 / 1280×720</span>
+          </div>
+          <div class="param-row">
+            <span>resolution</span>
+            <span>控制清晰度规格。</span>
+            <span>720p</span>
+          </div>
+          <div class="param-row">
+            <span>seed</span>
+            <span>可选；固定后更便于复现相近结果。</span>
+            <span>空</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="guide-grid">
+        <article class="explain-card">
+          <h2>同步还是异步</h2>
+          <p>
+            是异步。创建接口只负责排队并返回任务 ID，不会立刻返回 mp4。前端拿到
+            taskId 后，每 3 秒请求一次本地查询接口，直到状态变成 completed。
+          </p>
+          <pre><code>1. POST /api/videos
+2. 得到 taskId
+3. 循环 GET /api/videos/{taskId}
+4. completed 后读取 url 并播放视频</code></pre>
+        </article>
+
+        <article class="explain-card">
+          <h2>状态怎么理解</h2>
+          <p>
+            queued 表示排队，in_progress 表示生成中，completed 表示可播放。
+            failed、cancelled、expired 都是终止状态。
+          </p>
+          <pre><code>{
+  "taskId": "cgt-...",
+  "status": "completed",
+  "url": "https://.../result.mp4"
+}</code></pre>
+        </article>
+
+        <article class="explain-card">
+          <h2>为什么要后端代理</h2>
+          <p>
+            API key 属于敏感凭证。放在浏览器里会被任何人看到，所以必须由本地后端读取
+            NEWAPI_API_KEY，再把安全的任务结果返回给前端。
+          </p>
+        </article>
+
+        <article class="explain-card warning-card">
+          <h2>当前权限提示</h2>
+          <p>
+            如果请求返回“无权访问 auto 分组”，说明 token 所属分组没有权限访问当前模型或
+            当前网关分组。这不是前端问题，也不是同步异步问题。
+          </p>
+        </article>
+
+        <article class="explain-card">
+          <h2>失败时看什么</h2>
+          <p>
+            失败后点击“查看错误详情”，可以看到上游请求体、响应状态和完整返回体。
+            API key 会保留在后端，不会明文展示。
+          </p>
+        </article>
+      </section>
+
+      <section class="source-links">
+        <h2>对应文件</h2>
+        <a href="/app.js">前端逻辑：public/app.js</a>
+        <a href="/styles.css">样式：public/styles.css</a>
+        <span>后端逻辑在本地文件 server.js 中运行</span>
+      </section>
+    </main>
+
+    <script src="/guide.js" type="module"></script>
+  </body>
+</html>

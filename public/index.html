@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Seedance Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="studio-shell">
+      <header class="studio-topbar glass-panel">
+        <div class="brand-block">
+          <span class="brand-mark">S</span>
+          <div>
+            <h1>Seedance Studio</h1>
+            <p id="runtimeMeta">正在读取本地配置...</p>
+          </div>
+        </div>
+        <div class="top-actions">
+          <a class="ghost-link" href="/guide.html">接口原理</a>
+          <button class="ghost-button" id="configToggle" type="button">配置</button>
+          <div class="status-pill" id="keyState">检查中</div>
+        </div>
+      </header>
+
+      <section class="config-panel glass-panel" id="configPanel" hidden>
+        <form id="configForm" class="config-form">
+          <label class="field">
+            <span>Base URL</span>
+            <input id="baseUrlInput" type="url" placeholder="https://newapi.isnothing.net/" />
+          </label>
+          <label class="field">
+            <span>Model ID</span>
+            <input id="modelInput" type="text" placeholder="seedance-2.0-720p" />
+          </label>
+          <label class="field span-2">
+            <span>API key</span>
+            <input id="apiKeyInput" type="password" autocomplete="off" placeholder="留空则保留当前 key" />
+          </label>
+          <div class="config-actions span-2">
+            <label class="check-row">
+              <input id="clearApiKey" type="checkbox" />
+              <span>清空当前 API key</span>
+            </label>
+            <div class="button-row">
+              <span id="configStatus" class="inline-status"></span>
+              <button class="secondary-button compact" id="testApiButton" type="button">测试接口</button>
+              <button class="primary-button compact" type="submit">保存配置</button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <section class="creator-panel glass-panel">
+        <div class="panel-head">
+          <div>
+            <h2>创作输入</h2>
+            <p>短视频生成工作台</p>
+          </div>
+          <div class="mode-switch" role="tablist" aria-label="视频生成模式">
+            <button class="mode-button active" type="button" data-mode="text">文生视频</button>
+            <button class="mode-button" type="button" data-mode="image">图生视频</button>
+          </div>
+        </div>
+
+        <form id="videoForm" class="tool-surface">
+          <section class="prompt-card">
+            <div class="section-label">
+              <span>Prompt</span>
+              <span id="promptMeter">0 字</span>
+            </div>
+            <textarea
+              id="prompt"
+              rows="6"
+              placeholder="一只纸船在晨光里的池塘上漂过，镜头缓慢推进，水面有细小涟漪，写实电影感"
+            ></textarea>
+            <div class="template-row" id="templateRow" aria-label="提示词模板"></div>
+          </section>
+
+          <section class="image-panel" id="imagePanel" hidden>
+            <label class="field">
+              <span>参考图片 URL</span>
+              <input id="imageUrl" type="url" placeholder="https://example.com/image.jpg" />
+            </label>
+            <label class="upload-box">
+              <input id="imageFile" type="file" accept="image/*" />
+              <span>选择本地图片</span>
+            </label>
+            <div class="preview-frame" id="imagePreview">未选择图片</div>
+          </section>
+
+          <section class="settings-grid">
+            <label class="field">
+              <span>画幅</span>
+              <select id="ratio">
+                <option value="16:9" selected>16:9 横屏</option>
+                <option value="9:16">9:16 竖屏</option>
+                <option value="1:1">1:1 方形</option>
+                <option value="4:3">4:3</option>
+                <option value="3:4">3:4</option>
+                <option value="adaptive">自适应</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>时长</span>
+              <select id="duration">
+                <option value="5" selected>5 秒</option>
+                <option value="10">10 秒</option>
+                <option value="15">15 秒</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>分辨率</span>
+              <select id="resolution">
+                <option value="720p" selected>720p</option>
+                <option value="480p">480p</option>
+                <option value="1080p">1080p</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>镜头</span>
+              <select id="cameraMotion">
+                <option value="slow push in" selected>缓慢推进</option>
+                <option value="locked tripod shot">固定机位</option>
+                <option value="smooth lateral tracking shot">横向平移</option>
+                <option value="gentle handheld motion">轻微手持</option>
+                <option value="subtle orbit around the subject">环绕主体</option>
+                <option value="none">不指定</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>风格</span>
+              <select id="stylePreset">
+                <option value="cinematic realistic lighting" selected>电影写实</option>
+                <option value="clean commercial product shot">商业产品</option>
+                <option value="soft editorial portrait film">人像微动</option>
+                <option value="animated poster with refined motion">动态海报</option>
+                <option value="social short with high visual clarity">社媒短片</option>
+                <option value="none">不指定</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>运动强度</span>
+              <input id="motionStrength" type="range" min="1" max="10" value="4" />
+            </label>
+          </section>
+
+          <details class="advanced-panel">
+            <summary>高级设置</summary>
+            <div class="advanced-grid">
+              <label class="field">
+                <span>随机种子</span>
+                <input id="seed" type="number" min="0" placeholder="可选" />
+              </label>
+              <label class="field">
+                <span>负面提示词</span>
+                <input id="negativePrompt" type="text" value="text, watermark, logo, blurry, low quality" />
+              </label>
+              <label class="check-row">
+                <input id="watermark" type="checkbox" />
+                <span>显示水印</span>
+              </label>
+            </div>
+          </details>
+
+          <div class="actions">
+            <div class="estimate-pill" id="estimatePill">1280×720 · 5s</div>
+            <button id="submitButton" class="primary-button" type="submit">生成视频</button>
+          </div>
+        </form>
+      </section>
+
+      <aside class="preview-panel glass-panel">
+        <div class="result-header">
+          <div>
+            <h2>预览</h2>
+            <p id="previewSubtitle">等待生成</p>
+          </div>
+          <span id="taskBadge">未开始</span>
+        </div>
+        <div class="status-stack" id="statusStack">
+          <div class="status-step active" data-step="queued">提交</div>
+          <div class="status-step" data-step="in_progress">生成</div>
+          <div class="status-step" data-step="completed">完成</div>
+        </div>
+        <div class="result-body" id="resultBody">
+          <div class="empty-state">
+            <strong>Ready</strong>
+            <span>等待新的生成结果。</span>
+          </div>
+        </div>
+        <div class="history-panel">
+          <div class="history-head">
+            <h2>历史</h2>
+            <button class="ghost-button compact-ghost" id="clearHistory" type="button">清空</button>
+          </div>
+          <div id="historyList" class="history-list"></div>
+        </div>
+        <pre id="debugBox" class="debug-box"></pre>
+      </aside>
+    </main>
+
+    <dialog class="debug-modal" id="errorModal">
+      <div class="modal-head">
+        <h2>完整请求信息</h2>
+        <button class="ghost-button" id="closeErrorModal" type="button">关闭</button>
+      </div>
+      <pre id="errorDetail" class="modal-pre"></pre>
+    </dialog>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
