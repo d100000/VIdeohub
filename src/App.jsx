@@ -150,6 +150,35 @@ function copyText(value) {
   navigator.clipboard?.writeText(String(value));
 }
 
+function assetUrl(assetId) {
+  return assetId ? `/api/assets/${assetId}` : "";
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error("图片读取失败。"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadImageAsset(file, projectId, type = "reference_image") {
+  if (!file) return null;
+  const dataUrl = await fileToDataUrl(file);
+  const path = projectId ? `/api/projects/${projectId}/assets/upload` : "/api/assets/upload";
+  const result = await api(path, {
+    method: "POST",
+    body: JSON.stringify({
+      fileName: file.name,
+      dataUrl,
+      type,
+      projectId,
+    }),
+  });
+  return result.asset;
+}
+
 function TaskIdPill({ value, className = "", label = "Task ID", compact = false }) {
   const [copied, setCopied] = useState(false);
   if (!value) return null;
@@ -177,6 +206,73 @@ function ApiKeyHint() {
     <p className="api-key-hint">
       请通过 bobAPI 获取 API key，并选择包含 Seedance 模型的分组，例如：banana Pro 官转。
     </p>
+  );
+}
+
+function ImageUploadField({ label, value, onChange, projectId, type = "reference_image", helper = "上传 PNG、JPG 或 WebP 图片", compact = false, disabled = false }) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function onFileChange(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setUploading(true);
+    setError("");
+    try {
+      const asset = await uploadImageAsset(file, projectId, type);
+      onChange?.(asset?.url || "");
+    } catch (uploadError) {
+      setError(uploadError.message);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  return (
+    <div className={cx("image-upload-field nodrag", compact && "compact")}>
+      <div className="image-upload-head">
+        <span>{label}</span>
+        {value && !disabled && <button type="button" onClick={() => onChange?.("")}>清除</button>}
+      </div>
+      {value ? (
+        <div className="image-upload-preview">
+          <img src={value} alt="" />
+          <button type="button" onClick={() => copyText(value)}>
+            <Copy size={14} />
+            复制
+          </button>
+        </div>
+      ) : (
+        <label className="image-upload-drop">
+          <input type="file" accept="image/png,image/jpeg,image/webp" onChange={onFileChange} disabled={uploading || disabled} />
+          {uploading ? <Loader2 className="spin" size={16} /> : <Image size={16} />}
+          <strong>{uploading ? "上传中" : "上传图片"}</strong>
+          {!compact && <small>{helper}</small>}
+        </label>
+      )}
+      {error && <small className="image-upload-error">{error}</small>}
+    </div>
+  );
+}
+
+function FrameStrip({ firstFrameUrl, lastFrameUrl, compact = false }) {
+  if (!firstFrameUrl && !lastFrameUrl) return null;
+  return (
+    <div className={cx("frame-strip", compact && "compact")}>
+      {firstFrameUrl && (
+        <button type="button" onClick={() => copyText(firstFrameUrl)}>
+          <img src={firstFrameUrl} alt="" />
+          <span>首帧</span>
+        </button>
+      )}
+      {lastFrameUrl && (
+        <button type="button" onClick={() => copyText(lastFrameUrl)}>
+          <img src={lastFrameUrl} alt="" />
+          <span>尾帧</span>
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -367,7 +463,7 @@ function HomePage({ me, reload }) {
           <span className="mode-badge">推荐</span>
           <MessageSquare size={30} />
           <h3>对话式生成</h3>
-          <p>像即梦 Agent 一样输入一句话，系统帮你解析意图、补全参数、生成视频和续写下一段。</p>
+          <p>像即梦 Agent 一样输入一句话，系统帮你解析意图、补全参数、生成视频和下一镜头。</p>
           <button className="secondary-button" type="button" onClick={enter}>
             开始对话制作
           </button>
@@ -389,7 +485,7 @@ function HomePage({ me, reload }) {
           <h2>把每一次生成都变成可追溯的镜头链</h2>
         </div>
         <div className="feature-grid">
-          <Feature icon={<ChevronsRight />} title="连续续写" text="从已完成视频继续创建下一段，自动继承比例、模型、风格和上一段末帧。" />
+          <Feature icon={<ChevronsRight />} title="连续镜头" text="从已完成视频继续创建下一镜头，可选择是否使用上一段尾帧作为首帧。" />
           <Feature icon={<Frame />} title="首尾帧控制" text="用参考图、首帧、尾帧约束镜头起点和终点，让片段之间更连贯。" />
           <Feature icon={<Network />} title="无限画布" text="右键创建卡片、拖拽排列、多选整理、连线表达镜头关系。" />
           <Feature icon={<Lock />} title="后端保存" text="项目、参数、任务、错误和视频 URL 全部保存到 SQLite；API key 加密存储。" />
@@ -398,7 +494,7 @@ function HomePage({ me, reload }) {
 
       <section id="workflow" className="workflow-band">
         <div className="workflow-card">
-          {["注册登录", "配置 API key", "创建镜头卡", "生成视频", "续写下一段", "播放整条链"].map((item, index) => (
+          {["注册登录", "配置 API key", "创建镜头卡", "生成视频", "生成下一镜头", "播放整条链"].map((item, index) => (
             <div className="workflow-step" key={item}>
               <span>{index + 1}</span>
               <strong>{item}</strong>
@@ -852,6 +948,7 @@ function ProfileTaskCard({ task, onRefresh }) {
           {running || task.status === "failed" ? <button type="button" onClick={() => onRefresh(task.id)}>重新拉取</button> : null}
         </div>
         {task.error?.message && <div className="profile-task-error">{task.error.message}</div>}
+        {done && <FrameStrip firstFrameUrl={assetUrl(task.firstFrameAssetId)} lastFrameUrl={assetUrl(task.lastFrameAssetId)} compact />}
       </div>
     </article>
   );
@@ -1232,6 +1329,7 @@ function TaskCenterDrawer({ task, detail, loading, busy, onClose, onRefresh, onN
             <TaskIdPill value={currentTask.id} />
             <TaskIdPill value={currentTask.upstreamTaskId} label="上游 Task" />
           </div>
+          <FrameStrip firstFrameUrl={assetUrl(currentTask.firstFrameAssetId)} lastFrameUrl={assetUrl(currentTask.lastFrameAssetId)} />
           <div className={cx("recovery-card", advice.tone)}>
             <strong>{advice.title}</strong>
             <span>{advice.body}</span>
@@ -1437,6 +1535,7 @@ function ChatPage({ me }) {
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [inspectorTab, setInspectorTab] = useState("preview");
   const [debugModal, setDebugModal] = useState(null);
+  const [continueTaskId, setContinueTaskId] = useState("");
 
   useEffect(() => {
     api("/api/creation-sessions").then((result) => setSessions(result.sessions || []));
@@ -1524,13 +1623,19 @@ function ChatPage({ me }) {
     setPlan((current) => (current ? { ...current, [field]: value } : current));
   }
 
-  async function continueNext() {
+  async function continueNext(options = {}) {
     setBusy(true);
     try {
       const result = await api(`/api/creation-sessions/${params.sessionId}/continue`, {
         method: "POST",
-        body: JSON.stringify({ text: "延续上一镜头，继续描述下一段动作..." }),
+        body: JSON.stringify({
+          text: "延续上一镜头，继续描述下一段动作...",
+          fromTaskId: options.fromTaskId || continueTaskId || selectedTaskId,
+          useLastFrame: options.useLastFrame,
+          referenceImageUrl: options.referenceImageUrl || "",
+        }),
       });
+      setContinueTaskId("");
       setPlan(planFromEnvelope({ id: result.planId, status: "ready", plan: result.plan }));
       const refreshed = await api(`/api/creation-sessions/${params.sessionId}`);
       setMessages(refreshed.messages || []);
@@ -1658,7 +1763,7 @@ function ChatPage({ me }) {
               plan={plan}
               tasks={tasks}
               busy={busy}
-              onContinue={continueNext}
+              onContinue={(task) => setContinueTaskId(task?.id || selectedTaskId)}
               onSelectTask={(taskId) => {
                 setSelectedTaskId(taskId);
                 setInspectorTab("preview");
@@ -1704,9 +1809,17 @@ function ChatPage({ me }) {
         taskQuery={taskQuery}
         setTaskQuery={setTaskQuery}
         onSelectTask={setSelectedTaskId}
-        onContinue={continueNext}
+        onContinue={() => setContinueTaskId(currentVideo?.id || selectedTask?.id || "")}
         onOpenLogs={openTaskLogs}
       />
+      {continueTaskId && (
+        <ContinueClipModal
+          title="生成下一镜头"
+          clip={tasks.find((task) => task.id === continueTaskId)}
+          onClose={() => setContinueTaskId("")}
+          onSubmit={(options) => continueNext({ ...options, fromTaskId: continueTaskId })}
+        />
+      )}
       {debugModal && (debugModal.eventId ? <ErrorLogModal event={debugModal} onClose={() => setDebugModal(null)} /> : <DebugModal detail={debugModal} onClose={() => setDebugModal(null)} />)}
     </main>
   );
@@ -1856,7 +1969,7 @@ function ParsingCard() {
   );
 }
 
-function GenerationConfirmCard({ value, onChange, onSubmit, canSubmit = true, submitting = false, submitted = false, title = "参数确认", submitLabel = "确认并提交生成" }) {
+function GenerationConfirmCard({ value, onChange, onSubmit, canSubmit = true, submitting = false, submitted = false, title = "参数确认", submitLabel = "确认并提交生成", uploadProjectId = "" }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [templateSaved, setTemplateSaved] = useState(false);
   if (!value) return null;
@@ -1929,18 +2042,9 @@ function GenerationConfirmCard({ value, onChange, onSubmit, canSubmit = true, su
       </button>
       {advancedOpen && (
         <div className="confirm-advanced">
-          <label>
-            参考图 URL
-            <input value={value.referenceImageUrl || ""} readOnly={readonly} onChange={(event) => patch("referenceImageUrl", event.target.value)} placeholder="https://..." />
-          </label>
-          <label>
-            首帧 URL
-            <input value={value.firstFrameUrl || ""} readOnly={readonly} onChange={(event) => patch("firstFrameUrl", event.target.value)} placeholder="https://..." />
-          </label>
-          <label>
-            尾帧 URL
-            <input value={value.lastFrameUrl || ""} readOnly={readonly} onChange={(event) => patch("lastFrameUrl", event.target.value)} placeholder="https://..." />
-          </label>
+          <ImageUploadField label="参考图" value={value.referenceImageUrl || ""} onChange={(nextValue) => patch("referenceImageUrl", nextValue)} projectId={uploadProjectId} disabled={readonly} />
+          <ImageUploadField label="首帧" value={value.firstFrameUrl || ""} onChange={(nextValue) => patch("firstFrameUrl", nextValue)} projectId={uploadProjectId} type="first_frame" disabled={readonly} />
+          <ImageUploadField label="尾帧" value={value.lastFrameUrl || ""} onChange={(nextValue) => patch("lastFrameUrl", nextValue)} projectId={uploadProjectId} type="last_frame" disabled={readonly} />
           <label>
             Seed
             <input value={value.seed || ""} readOnly={readonly} onChange={(event) => patch("seed", event.target.value)} placeholder="可留空" />
@@ -2025,7 +2129,12 @@ function TaskChatCard({ task, index, onDebug, onRefresh, onContinue, onSelect })
         </div>
         <span>{taskStatusLabel(task.status)} · {task.progress ?? 0}%</span>
       </div>
-      {done && <video src={task.videoUrl} autoPlay muted loop controls playsInline />}
+      {done && (
+        <>
+          <video src={task.videoUrl} autoPlay muted loop controls playsInline />
+          <FrameStrip firstFrameUrl={assetUrl(task.firstFrameAssetId)} lastFrameUrl={assetUrl(task.lastFrameAssetId)} compact />
+        </>
+      )}
       {!done && !failed && (
         <div className="task-waiting-box">
           <div className={cx("video-skeleton", running && "running")}>
@@ -2045,7 +2154,7 @@ function TaskChatCard({ task, index, onDebug, onRefresh, onContinue, onSelect })
         </div>
       )}
       <div className="task-actions">
-        {done && <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onContinue(); }}>续写下一段</button>}
+        {done && <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onContinue(task); }}>生成下一镜头</button>}
         {failed && (
           <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onRefresh?.(task.id); }}>
             <RotateCcw size={15} />
@@ -2116,13 +2225,14 @@ function ResultInspector({ tab, setTab, task, currentVideo, plan, tasks, taskQue
           {currentVideo ? (
             <>
               <video src={currentVideo.videoUrl} autoPlay muted loop controls playsInline />
+              <FrameStrip firstFrameUrl={assetUrl(currentVideo.firstFrameAssetId)} lastFrameUrl={assetUrl(currentVideo.lastFrameAssetId)} />
               <div className="task-trace">
                 <span>{taskStatusLabel(currentVideo.status)}</span>
                 <strong>{currentVideo.progress ?? 100}%</strong>
               </div>
               <input value={currentVideo.videoUrl || ""} readOnly />
               <button className="full-primary" type="button" onClick={onContinue}>
-                续写下一段
+                生成下一镜头
               </button>
             </>
           ) : (
@@ -2401,6 +2511,7 @@ function TaskQueryResult({ detail, onRefresh }) {
             <TaskIdPill value={task.id} />
             <TaskIdPill value={task.upstreamTaskId} label="上游 Task" />
           </div>
+          <FrameStrip firstFrameUrl={assetUrl(task.firstFrameAssetId)} lastFrameUrl={assetUrl(task.lastFrameAssetId)} />
           <div className="task-result-buttons">
             <button className="secondary-button" type="button" onClick={() => onRefresh?.(task.id)}>
               <RotateCcw size={15} />
@@ -2427,6 +2538,7 @@ function TaskQueryResult({ detail, onRefresh }) {
             <InspectorKV label="Project ID" value={task.projectId} />
             <InspectorKV label="Source Node" value={task.sourceNodeId} />
             <InspectorKV label="Result Node" value={task.resultNodeId} />
+            <InspectorKV label="First Frame Asset" value={task.firstFrameAssetId || "无"} />
             <InspectorKV label="Last Frame Asset" value={task.lastFrameAssetId || "无"} />
             <InspectorKV label="创建时间" value={task.createdAt} />
             <InspectorKV label="完成时间" value={task.completedAt || "未完成"} />
@@ -2966,14 +3078,15 @@ function ShotNode({ id, data, selected }) {
           </select>
         </label>
       </div>
-      <label className="mini-field nodrag">
-        首帧 / 参考图 URL
-        <input
-          value={data.firstFrameUrl || data.referenceImageUrl || ""}
-          onChange={(event) => patch("firstFrameUrl", event.target.value)}
-          placeholder="https://..."
+      <div className="node-upload-wrap">
+        <ImageUploadField
+          label="参考图"
+          value={data.referenceImageUrl || ""}
+          onChange={(value) => patch("referenceImageUrl", value)}
+          projectId={actions.projectId}
+          compact
         />
-      </label>
+      </div>
       <div className="node-actions">
         <button className="node-primary nodrag" type="button" disabled={submitting} onClick={() => actions.generate?.(id)}>
           {submitting ? <Loader2 className="spin" size={15} /> : <WandSparkles size={15} />}
@@ -3019,7 +3132,14 @@ function RenderNode({ id, data, selected }) {
         </div>
       )}
       {done && (
-        <video className="node-video nodrag" src={data.videoUrl} muted autoPlay loop playsInline controls />
+        <>
+          <video className="node-video nodrag" src={data.videoUrl} muted autoPlay loop playsInline controls />
+          <FrameStrip
+            firstFrameUrl={assetUrl(data.firstFrameAssetId)}
+            lastFrameUrl={assetUrl(data.lastFrameAssetId)}
+            compact
+          />
+        </>
       )}
       {failed && (
         <div className="node-error">
@@ -3031,7 +3151,7 @@ function RenderNode({ id, data, selected }) {
         {done && (
           <button className="node-primary nodrag" type="button" onClick={() => actions.continueFrom?.(id)}>
             <ChevronsRight size={15} />
-            续写下一段
+            生成下一镜头
           </button>
         )}
         {failed && data.taskId && (
@@ -3096,6 +3216,7 @@ const renderRuntimeFields = new Set([
   "upstreamTaskId",
   "videoUrl",
   "resultUrl",
+  "firstFrameAssetId",
   "lastFrameAssetId",
   "error",
   "errorCode",
@@ -3213,6 +3334,7 @@ function Studio({ me, projects, projectId }) {
   const [debugModal, setDebugModal] = useState(null);
   const [sequenceClip, setSequenceClip] = useState(0);
   const [confirmNodeId, setConfirmNodeId] = useState("");
+  const [continueNodeId, setContinueNodeId] = useState("");
   const loadedRef = useRef(false);
   const saveTimerRef = useRef(null);
   const skipNextAutosaveRef = useRef(false);
@@ -3221,13 +3343,14 @@ function Studio({ me, projects, projectId }) {
 
   const actionHandlers = useMemo(
     () => ({
+      projectId,
       patchNode: (nodeId, patch) => {
         setNodes((current) =>
           current.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, ...patch } } : node)),
         );
       },
       generate: (nodeId) => requestGenerateFromNode(nodeId),
-      continueFrom: async (nodeId) => continueFromRender(nodeId),
+      continueFrom: (nodeId) => requestContinueFromRender(nodeId),
       duplicate: (nodeId) => duplicateNode(nodeId),
       showDebug: async (taskId, eventId) => showDebug(taskId, eventId),
       refreshTask: async (taskId) => refreshTaskResult(taskId),
@@ -3247,6 +3370,7 @@ function Studio({ me, projects, projectId }) {
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
   const confirmNode = nodes.find((node) => node.id === confirmNodeId);
+  const continueNode = nodes.find((node) => node.id === continueNodeId);
   const runningCount = nodes.filter((node) => node.type === "render" && ["queued", "in_progress"].includes(node.data?.status)).length;
   const completedClips = useMemo(
     () => orderSequenceClips(nodes, edges),
@@ -3333,6 +3457,7 @@ function Studio({ me, projects, projectId }) {
                 progress: task.progress,
                 videoUrl: task.videoUrl || item.data.videoUrl,
                 resultUrl: task.resultUrl || item.data.resultUrl,
+                firstFrameAssetId: task.firstFrameAssetId,
                 lastFrameAssetId: task.lastFrameAssetId,
                 error: task.error?.message || "",
               },
@@ -3474,6 +3599,17 @@ function Studio({ me, projects, projectId }) {
     generateFromNode(nodeId);
   }
 
+  function requestContinueFromRender(nodeId) {
+    const node = nodes.find((item) => item.id === nodeId);
+    if (!node) return;
+    if (node.type === "render" && node.data?.videoUrl) {
+      setContinueNodeId(nodeId);
+      setSelectedNodeId(nodeId);
+      return;
+    }
+    continueFromRender(nodeId);
+  }
+
   function patchConfirmNode(field, value) {
     if (!confirmNodeId) return;
     setNodes((current) =>
@@ -3516,11 +3652,16 @@ function Studio({ me, projects, projectId }) {
     }
   }
 
-  async function continueFromRender(nodeId) {
+  async function continueFromRender(nodeId, options = {}) {
     try {
       const result = await api(`/api/projects/${projectId}/render-nodes/${nodeId}/continue`, {
         method: "POST",
+        body: JSON.stringify({
+          useLastFrame: options.useLastFrame,
+          referenceImageUrl: options.referenceImageUrl || "",
+        }),
       });
+      setContinueNodeId("");
       setNodes((current) => [...current, result.node]);
       setEdges((current) => [...current, result.edge]);
       setSelectedNodeId(result.node.id);
@@ -3548,6 +3689,7 @@ function Studio({ me, projects, projectId }) {
               upstreamTaskId: task.upstreamTaskId || item.data.upstreamTaskId,
               videoUrl: task.videoUrl || item.data.videoUrl,
               resultUrl: task.resultUrl || item.data.resultUrl,
+              firstFrameAssetId: task.firstFrameAssetId,
               lastFrameAssetId: task.lastFrameAssetId,
               error: task.error?.message || "",
             },
@@ -3699,7 +3841,7 @@ function Studio({ me, projects, projectId }) {
         </ReactFlow>
       </section>
 
-      <PropertyPanel node={selectedNode} onPatch={actionHandlers.patchNode} onGenerate={requestGenerateFromNode} onContinue={continueFromRender} onRefreshTask={refreshTaskResult} />
+      <PropertyPanel node={selectedNode} onPatch={actionHandlers.patchNode} onGenerate={requestGenerateFromNode} onContinue={requestContinueFromRender} onRefreshTask={refreshTaskResult} />
       <SequenceBar clips={completedClips} activeIndex={sequenceClip} setActiveIndex={setSequenceClip} />
 
       {contextMenu && (
@@ -3712,7 +3854,7 @@ function Studio({ me, projects, projectId }) {
           onDuplicate={() => contextMenu.nodeId && duplicateNode(contextMenu.nodeId)}
           onDelete={() => contextMenu.nodeId && deleteNode(contextMenu.nodeId)}
           onGenerate={() => contextMenu.nodeId && requestGenerateFromNode(contextMenu.nodeId)}
-          onContinue={() => contextMenu.nodeId && continueFromRender(contextMenu.nodeId)}
+          onContinue={() => contextMenu.nodeId && requestContinueFromRender(contextMenu.nodeId)}
           onDebug={() => {
             const node = nodes.find((item) => item.id === contextMenu.nodeId);
             showDebug(node?.data?.taskId);
@@ -3722,9 +3864,24 @@ function Studio({ me, projects, projectId }) {
       {confirmNode && (
         <GenerationConfirmModal
           node={confirmNode}
+          projectId={projectId}
           onChange={patchConfirmNode}
           onClose={() => setConfirmNodeId("")}
           onSubmit={() => generateFromNode(confirmNode.id)}
+        />
+      )}
+      {continueNode && (
+        <ContinueClipModal
+          title="生成下一镜头"
+          clip={{
+            id: continueNode.data?.taskId,
+            videoUrl: continueNode.data?.videoUrl,
+            firstFrameAssetId: continueNode.data?.firstFrameAssetId,
+            lastFrameAssetId: continueNode.data?.lastFrameAssetId,
+          }}
+          projectId={projectId}
+          onClose={() => setContinueNodeId("")}
+          onSubmit={(options) => continueFromRender(continueNode.id, options)}
         />
       )}
       {debugModal && <DebugModal detail={debugModal} onClose={() => setDebugModal(null)} />}
@@ -3785,18 +3942,9 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
             模型
             <input value={data.model || defaultModel} onChange={(event) => patch("model", event.target.value)} />
           </label>
-          <label>
-            参考图 URL
-            <input value={data.referenceImageUrl || ""} onChange={(event) => patch("referenceImageUrl", event.target.value)} />
-          </label>
-          <label>
-            首帧 URL
-            <input value={data.firstFrameUrl || ""} onChange={(event) => patch("firstFrameUrl", event.target.value)} />
-          </label>
-          <label>
-            尾帧 URL
-            <input value={data.lastFrameUrl || ""} onChange={(event) => patch("lastFrameUrl", event.target.value)} />
-          </label>
+          <ImageUploadField label="参考图" value={data.referenceImageUrl || ""} onChange={(value) => patch("referenceImageUrl", value)} projectId={data.actions?.projectId} />
+          <ImageUploadField label="首帧" value={data.firstFrameUrl || ""} onChange={(value) => patch("firstFrameUrl", value)} projectId={data.actions?.projectId} type="first_frame" />
+          <ImageUploadField label="尾帧" value={data.lastFrameUrl || ""} onChange={(value) => patch("lastFrameUrl", value)} projectId={data.actions?.projectId} type="last_frame" />
           <div className="panel-grid">
             <label>
               镜头运动
@@ -3864,13 +4012,14 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
           {data.videoUrl && (
             <>
               <video className="panel-video" src={data.videoUrl} muted autoPlay loop controls playsInline />
+              <FrameStrip firstFrameUrl={assetUrl(data.firstFrameAssetId)} lastFrameUrl={assetUrl(data.lastFrameAssetId)} />
               <label>
                 视频 URL
                 <input value={data.videoUrl} readOnly />
               </label>
               <button className="full-primary" type="button" onClick={() => onContinue(node.id)}>
                 <ChevronsRight size={16} />
-                续写下一段
+                生成下一镜头
               </button>
             </>
           )}
@@ -3911,7 +4060,7 @@ function ContextMenu({ menu, node, onAddShot, onAddNote, onAddAsset, onDuplicate
           {node.type === "render" && node.data?.status === "completed" && (
             <button type="button" onClick={onContinue}>
               <ChevronsRight size={15} />
-              续写下一段
+              生成下一镜头
             </button>
           )}
           {node.type === "render" && (
@@ -4009,7 +4158,62 @@ function SequenceBar({ clips, activeIndex, setActiveIndex }) {
   );
 }
 
-function GenerationConfirmModal({ node, onChange, onClose, onSubmit }) {
+function ContinueClipModal({ title, clip, projectId = "", onClose, onSubmit }) {
+  const lastFrameUrl = assetUrl(clip?.lastFrameAssetId);
+  const firstFrameUrl = assetUrl(clip?.firstFrameAssetId);
+  const [useLastFrame, setUseLastFrame] = useState(Boolean(lastFrameUrl));
+  const [referenceImageUrl, setReferenceImageUrl] = useState("");
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section className="continue-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <strong>{title}</strong>
+            <span>先选择连续性方式，再创建下一段镜头卡。</span>
+          </div>
+          <button className="tool-button" type="button" onClick={onClose}>
+            <Check size={17} />
+          </button>
+        </div>
+        <div className="continue-body">
+          {clip?.videoUrl && <video src={clip.videoUrl} muted loop controls playsInline />}
+          <FrameStrip firstFrameUrl={firstFrameUrl} lastFrameUrl={lastFrameUrl} />
+          <label className={cx("continue-choice", !lastFrameUrl && "disabled")}>
+            <input
+              type="checkbox"
+              checked={useLastFrame}
+              disabled={!lastFrameUrl}
+              onChange={(event) => setUseLastFrame(event.target.checked)}
+            />
+            <div>
+              <strong>使用上一段尾帧作为下一段首帧</strong>
+              <span>{lastFrameUrl ? "推荐用于连续视频，能更稳地衔接画面。" : "当前还没有尾帧资产，可以先重新拉取任务或直接逻辑续写。"}</span>
+            </div>
+          </label>
+          <ImageUploadField
+            label="额外参考图"
+            value={referenceImageUrl}
+            onChange={setReferenceImageUrl}
+            projectId={projectId}
+            helper="可上传人物、产品、风格或构图参考图"
+          />
+          <div className="continue-actions">
+            <button className="secondary-button" type="button" onClick={onClose}>
+              取消
+            </button>
+            <button className="hero-primary" type="button" onClick={() => onSubmit?.({ useLastFrame, referenceImageUrl })}>
+              <ChevronsRight size={16} />
+              创建下一镜头
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function GenerationConfirmModal({ node, projectId, onChange, onClose, onSubmit }) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <section className="generation-confirm-modal" onClick={(event) => event.stopPropagation()}>
@@ -4027,6 +4231,7 @@ function GenerationConfirmModal({ node, onChange, onClose, onSubmit }) {
           onChange={onChange}
           onSubmit={onSubmit}
           submitLabel="确认并生成这个镜头"
+          uploadProjectId={projectId}
         />
       </section>
     </div>

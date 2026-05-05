@@ -1372,6 +1372,146 @@ a {
   background: rgba(37, 99, 235, 0.12);
 }
 
+.image-upload-field {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.image-upload-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #bfdbfe;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.image-upload-head button,
+.image-upload-preview button {
+  min-height: 28px;
+  padding: 0 8px;
+  color: #bfdbfe;
+  border: 1px solid rgba(96,165,250,.18);
+  background: rgba(37,99,235,.1);
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.image-upload-drop {
+  display: grid;
+  min-height: 92px;
+  place-items: center;
+  align-content: center;
+  gap: 5px;
+  padding: 12px;
+  color: #dbeafe;
+  border: 1px dashed rgba(96,165,250,.34);
+  background: rgba(37,99,235,.09);
+  border-radius: 8px;
+  text-align: center;
+}
+
+.image-upload-drop input {
+  display: none;
+}
+
+.image-upload-drop small {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.image-upload-preview {
+  position: relative;
+  overflow: hidden;
+  min-height: 92px;
+  border: 1px solid rgba(255,255,255,.1);
+  background: #020617;
+  border-radius: 8px;
+}
+
+.image-upload-preview img {
+  display: block;
+  width: 100%;
+  height: 140px;
+  object-fit: cover;
+}
+
+.image-upload-preview button {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(15,23,42,.84);
+}
+
+.image-upload-field.compact .image-upload-drop,
+.image-upload-field.compact .image-upload-preview {
+  min-height: 58px;
+}
+
+.image-upload-field.compact .image-upload-preview img {
+  height: 72px;
+}
+
+.image-upload-error {
+  color: #fecaca;
+  font-size: 12px;
+}
+
+.frame-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.frame-strip button {
+  position: relative;
+  overflow: hidden;
+  min-height: 104px;
+  padding: 0;
+  color: #e5e7eb;
+  border: 1px solid rgba(96,165,250,.18);
+  background: #020617;
+  border-radius: 8px;
+}
+
+.frame-strip img {
+  display: block;
+  width: 100%;
+  height: 120px;
+  object-fit: cover;
+}
+
+.frame-strip span {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  padding: 4px 7px;
+  color: #dbeafe;
+  background: rgba(15,23,42,.82);
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.frame-strip.compact {
+  padding: 0 12px 10px;
+}
+
+.frame-strip.compact button {
+  min-height: 62px;
+}
+
+.frame-strip.compact img {
+  height: 66px;
+}
+
 .profile-key-form {
   display: grid;
   gap: 12px;
@@ -3301,6 +3441,10 @@ a {
   padding: 0 12px 10px;
 }
 
+.node-upload-wrap {
+  padding: 0 12px 10px;
+}
+
 .compact-grid label,
 .mini-field {
   display: grid;
@@ -3705,6 +3849,74 @@ a {
   background: rgba(14, 18, 28, 0.97);
   border-radius: 18px;
   box-shadow: 0 30px 120px rgba(0, 0, 0, 0.5);
+}
+
+.continue-modal {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(720px, 96vw);
+  max-height: min(860px, 92vh);
+  overflow: hidden;
+  color: #e5e7eb;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(14, 18, 28, 0.97);
+  border-radius: 18px;
+  box-shadow: 0 30px 120px rgba(0, 0, 0, 0.5);
+}
+
+.continue-body {
+  display: grid;
+  gap: 12px;
+  overflow: auto;
+  min-height: 0;
+  padding: 16px;
+}
+
+.continue-body video {
+  width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+  background: #020617;
+  border-radius: 8px;
+}
+
+.continue-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+  color: #dbeafe;
+  border: 1px solid rgba(96,165,250,.22);
+  background: rgba(37,99,235,.11);
+  border-radius: 8px;
+}
+
+.continue-choice.disabled {
+  color: #94a3b8;
+  border-color: rgba(255,255,255,.1);
+  background: rgba(255,255,255,.045);
+}
+
+.continue-choice input {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+}
+
+.continue-choice div {
+  display: grid;
+  gap: 5px;
+}
+
+.continue-choice span {
+  color: #94a3b8;
+  line-height: 1.5;
+}
+
+.continue-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 .generation-confirm-modal > .generation-confirm-card {
