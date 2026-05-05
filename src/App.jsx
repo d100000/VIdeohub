@@ -53,6 +53,7 @@ import {
   useNavigate,
   useParams,
 } from "react-router-dom";
+import { taskRecoveryAdvice, taskSourceLabel, taskStatusLabel } from "./taskLogic.js";
 
 const providerBaseUrl = "https://www.taijiai.online/";
 const defaultModel = "seedance-2.0-720p";
@@ -149,6 +150,36 @@ function copyText(value) {
   navigator.clipboard?.writeText(String(value));
 }
 
+function TaskIdPill({ value, className = "", label = "Task ID", compact = false }) {
+  const [copied, setCopied] = useState(false);
+  if (!value) return null;
+  return (
+    <button
+      className={cx("task-id-pill", compact && "compact", copied && "copied", className)}
+      type="button"
+      title={copied ? "已复制" : "复制 Task ID"}
+      onClick={(event) => {
+        event.stopPropagation();
+        copyText(value);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      }}
+    >
+      <span>{copied ? "已复制" : label}</span>
+      <code>{value}</code>
+      {copied ? <Check size={compact ? 13 : 15} /> : <Copy size={compact ? 13 : 15} />}
+    </button>
+  );
+}
+
+function ApiKeyHint() {
+  return (
+    <p className="api-key-hint">
+      请通过 bobAPI 获取 API key，并选择包含 Seedance 模型的分组，例如：banana Pro 官转。
+    </p>
+  );
+}
+
 function cx(...classes) {
   return classes.filter(Boolean).join(" ");
 }
@@ -236,7 +267,9 @@ function GlassNav({ user, onLogout }) {
         <a href="/#features">功能</a>
         <a href="/#workflow">流程</a>
         <a href="/#security">安全</a>
+        {user && <Link to="/tasks">任务中心</Link>}
         {user && <Link to="/logs">错误日志</Link>}
+        {user && <Link to="/profile">个人信息</Link>}
         {user?.isAdmin && <Link to="/admin/requests">管理后台</Link>}
       </nav>
       <div className="nav-actions">
@@ -249,6 +282,12 @@ function GlassNav({ user, onLogout }) {
             )}
             <Link className="ghost-link" to="/app">
               专业画布
+            </Link>
+            <Link className="ghost-link" to="/profile">
+              个人信息
+            </Link>
+            <Link className="ghost-link" to="/tasks">
+              任务中心
             </Link>
             <Link className="primary-link" to="/make">
               立即制作
@@ -548,6 +587,7 @@ function Onboarding({ me, reload }) {
         <p className="muted">
           上游站点已固定为 {providerBaseUrl}。API key 会加密保存在后端，页面不会回显完整内容。
         </p>
+        <ApiKeyHint />
         <form className="key-form" onSubmit={saveKey}>
           <label>
             API key
@@ -584,10 +624,683 @@ function Onboarding({ me, reload }) {
   );
 }
 
+function ProfilePage({ me, reload }) {
+  const navigate = useNavigate();
+  const [apiKey, setApiKey] = useState("");
+  const [status, setStatus] = useState("");
+  const [statusTone, setStatusTone] = useState("info");
+  const [busy, setBusy] = useState(false);
+  const [tasks, setTasks] = useState([]);
+  const [taskQuery, setTaskQuery] = useState("");
+  const [taskStatus, setTaskStatus] = useState("");
+  const [loadingTasks, setLoadingTasks] = useState(true);
+
+  const loadTasks = useCallback(async () => {
+    setLoadingTasks(true);
+    const params = new URLSearchParams();
+    if (taskQuery.trim()) params.set("q", taskQuery.trim());
+    if (taskStatus) params.set("status", taskStatus);
+    const result = await api(`/api/me/tasks?${params.toString()}`);
+    setTasks(result.tasks || []);
+    setLoadingTasks(false);
+  }, [taskQuery, taskStatus]);
+
+  useEffect(() => {
+    loadTasks().catch((error) => {
+      setStatus(error.message);
+      setStatusTone("error");
+      setLoadingTasks(false);
+    });
+  }, [loadTasks]);
+
+  async function saveKey(event) {
+    event.preventDefault();
+    setBusy(true);
+    setStatus("正在保存新的 API key...");
+    setStatusTone("info");
+    try {
+      await api("/api/me/api-key", { method: "PUT", body: JSON.stringify({ apiKey }) });
+      setApiKey("");
+      await reload();
+      setStatus("API key 已更新。之后的新任务会使用新 key。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(error.message);
+      setStatusTone("error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteKey() {
+    setBusy(true);
+    setStatus("正在删除 API key...");
+    setStatusTone("info");
+    try {
+      await api("/api/me/api-key", { method: "DELETE" });
+      await reload();
+      setStatus("API key 已删除。生成前需要重新配置。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(error.message);
+      setStatusTone("error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function testKey() {
+    setBusy(true);
+    setStatus("正在提交测试请求...");
+    setStatusTone("info");
+    try {
+      const result = await api("/api/me/api-key/test", { method: "POST" });
+      setStatus(result.upstreamTaskId ? `测试任务已提交：${result.upstreamTaskId}` : "接口连通。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(error.message);
+      setStatusTone("error");
+    } finally {
+      await loadTasks().catch(() => null);
+      setBusy(false);
+    }
+  }
+
+  async function refreshTask(taskId) {
+    try {
+      await api(`/api/tasks/${taskId}?force=1`);
+      await loadTasks();
+    } catch (error) {
+      setStatus(error.message);
+      setStatusTone("error");
+    }
+  }
+
+  const completedCount = tasks.filter((task) => task.status === "completed").length;
+  const runningCount = tasks.filter((task) => ["queued", "submitted", "in_progress"].includes(task.status)).length;
+
+  return (
+    <main className="profile-page">
+      <header className="profile-topbar">
+        <Link className="brand" to="/make">
+          <ProductLogo />
+          个人信息
+        </Link>
+        <div className="profile-actions">
+          <button className="secondary-button" type="button" onClick={() => navigate("/make")}>
+            返回制作
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/task-query")}>
+            Task 查询
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/tasks")}>
+            任务中心
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/app")}>
+            专业画布
+          </button>
+        </div>
+      </header>
+
+      <section className="profile-hero">
+        <div>
+          <p className="eyebrow">Account</p>
+          <h1>{me.user.email}</h1>
+          <p>管理 API key，查看历史生成记录和结果。这里是排查任务、复制结果和回到画布的入口。</p>
+        </div>
+        <div className="profile-stats">
+          <span><strong>{tasks.length}</strong>历史任务</span>
+          <span><strong>{completedCount}</strong>已完成</span>
+          <span><strong>{runningCount}</strong>运行中</span>
+        </div>
+      </section>
+
+      <section className="profile-grid">
+        <article className="profile-panel">
+          <div className="profile-panel-head">
+            <div>
+              <h2>API Key</h2>
+              <p>当前状态：{me.user.apiKey?.configured ? `${me.user.apiKey.preview} · ${me.user.apiKey.updatedAt || "已保存"}` : "尚未配置"}</p>
+            </div>
+            <KeyRound size={22} />
+          </div>
+          <form className="profile-key-form" onSubmit={saveKey}>
+            <label>
+              新 API key
+              <input value={apiKey} onChange={(event) => setApiKey(event.target.value)} type="password" placeholder="sk-..." />
+            </label>
+            <ApiKeyHint />
+            <button className="full-primary" type="submit" disabled={busy || !apiKey.trim()}>
+              保存 / 替换 API key
+            </button>
+          </form>
+          <div className="profile-button-row">
+            <button className="secondary-button" type="button" disabled={busy || !me.user.apiKey?.configured} onClick={testKey}>
+              测试当前 key
+            </button>
+            <button className="secondary-button danger-lite" type="button" disabled={busy || !me.user.apiKey?.configured} onClick={deleteKey}>
+              删除 key
+            </button>
+          </div>
+          {status && <div className={cx("setup-status", statusTone)}>{status}</div>}
+        </article>
+
+        <article className="profile-panel history-panel">
+          <div className="profile-panel-head">
+            <div>
+              <h2>历史生成记录</h2>
+              <p>所有对话和画布生成任务都会汇总在这里。</p>
+            </div>
+            <Film size={22} />
+          </div>
+          <div className="history-filters">
+            <div className="sidebar-search light">
+              <Search size={15} />
+              <input value={taskQuery} onChange={(event) => setTaskQuery(event.target.value)} placeholder="搜索 task / 上游 task / URL" />
+            </div>
+            <select value={taskStatus} onChange={(event) => setTaskStatus(event.target.value)}>
+              <option value="">全部状态</option>
+              <option value="queued">等待中</option>
+              <option value="in_progress">生成中</option>
+              <option value="completed">已完成</option>
+              <option value="failed">失败</option>
+            </select>
+            <button className="secondary-button" type="button" onClick={loadTasks}>
+              <RotateCcw size={15} />
+              刷新
+            </button>
+          </div>
+          <div className="profile-task-list">
+            {loadingTasks && <p className="muted">加载中...</p>}
+            {!loadingTasks && !tasks.length && <p className="muted">暂无生成任务。</p>}
+            {tasks.map((task) => (
+              <ProfileTaskCard key={task.id} task={task} onRefresh={refreshTask} />
+            ))}
+          </div>
+        </article>
+      </section>
+    </main>
+  );
+}
+
+function ProfileTaskCard({ task, onRefresh }) {
+  const done = task.status === "completed" && task.videoUrl;
+  const running = ["queued", "submitted", "in_progress"].includes(task.status);
+  return (
+    <article className={cx("profile-task-card", task.status)}>
+      <div className="profile-task-preview">
+        {done ? (
+          <video src={task.videoUrl} muted loop controls playsInline />
+        ) : (
+          <div>
+            {running ? <Loader2 className="spin" size={24} /> : <Film size={24} />}
+            <span>{taskStatusLabel(task.status)}</span>
+          </div>
+        )}
+      </div>
+      <div className="profile-task-body">
+        <div className="profile-task-title">
+          <strong>{task.projectName || "未命名项目"}</strong>
+          <span>{taskStatusLabel(task.status)} · {task.progress ?? 0}%</span>
+        </div>
+        <TaskIdPill value={task.id} compact />
+        <TaskIdPill value={task.upstreamTaskId} label="上游 Task" compact />
+        <div className="profile-task-meta">
+          <span>{task.createdAt}</span>
+          {task.videoUrl && <button type="button" onClick={() => copyText(task.videoUrl)}>复制视频 URL</button>}
+          <Link to={`/task-query?taskId=${encodeURIComponent(task.id)}`}>查看结果</Link>
+          {running || task.status === "failed" ? <button type="button" onClick={() => onRefresh(task.id)}>重新拉取</button> : null}
+        </div>
+        {task.error?.message && <div className="profile-task-error">{task.error.message}</div>}
+      </div>
+    </article>
+  );
+}
+
+const defaultTaskFilters = {
+  q: "",
+  status: "",
+  source: "",
+  projectId: "",
+  createdFrom: "",
+  createdTo: "",
+  hasVideo: "",
+  failedOnly: "",
+};
+
+function TaskCenterPage({ me }) {
+  const navigate = useNavigate();
+  const [tasks, setTasks] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [filters, setFilters] = useState(defaultTaskFilters);
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [detail, setDetail] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+
+  const queryString = useMemo(() => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value) params.set(key, value);
+    });
+    params.set("limit", "200");
+    return params.toString();
+  }, [filters]);
+
+  const loadTasks = useCallback(async () => {
+    setLoading(true);
+    const result = await api(`/api/tasks?${queryString}`);
+    setTasks(result.tasks || []);
+    setProjects(result.projects || []);
+    setLoading(false);
+    setSelectedIds((current) => {
+      const visibleIds = new Set((result.tasks || []).map((task) => task.id));
+      return new Set([...current].filter((idValue) => visibleIds.has(idValue)));
+    });
+  }, [queryString]);
+
+  useEffect(() => {
+    loadTasks().catch((error) => {
+      setStatus(error.message);
+      setLoading(false);
+    });
+  }, [loadTasks]);
+
+  useEffect(() => {
+    if (!selectedTaskId) {
+      setDetail(null);
+      return;
+    }
+    setDetailLoading(true);
+    api(`/api/task-query/${encodeURIComponent(selectedTaskId)}`)
+      .then((result) => setDetail(result))
+      .catch((error) => setDetail({ error: error.body || { message: error.message } }))
+      .finally(() => setDetailLoading(false));
+  }, [selectedTaskId]);
+
+  function patchFilter(field, value) {
+    setFilters((current) => ({ ...current, [field]: value }));
+  }
+
+  function toggleSelected(taskId) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(taskId)) next.delete(taskId);
+      else next.add(taskId);
+      return next;
+    });
+  }
+
+  function toggleAllVisible() {
+    setSelectedIds((current) => {
+      if (current.size === tasks.length) return new Set();
+      return new Set(tasks.map((task) => task.id));
+    });
+  }
+
+  async function refreshSelected(mode = "") {
+    setBusy(true);
+    setStatus("正在重新拉取任务状态...");
+    try {
+      const taskIds = [...selectedIds];
+      const result = await api("/api/tasks/batch-refresh", {
+        method: "POST",
+        body: JSON.stringify(taskIds.length ? { taskIds } : { mode }),
+      });
+      setStatus(`已刷新 ${result.count || 0} 个任务。`);
+      await loadTasks();
+      if (selectedTaskId) {
+        const detailResult = await api(`/api/task-query/${encodeURIComponent(selectedTaskId)}`);
+        setDetail(detailResult);
+      }
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshOne(taskId) {
+    setBusy(true);
+    setStatus("正在重新拉取任务状态...");
+    try {
+      const result = await api(`/api/tasks/${encodeURIComponent(taskId)}?force=1`);
+      setTasks((current) => current.map((task) => (task.id === result.task.id ? { ...task, ...result.task } : task)));
+      const detailResult = await api(`/api/task-query/${encodeURIComponent(result.task.id)}`);
+      setDetail(detailResult);
+      setStatus("任务状态已刷新。");
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function copyCompletedUrls() {
+    const ids = selectedIds.size ? selectedIds : new Set(tasks.map((task) => task.id));
+    const urls = tasks
+      .filter((task) => ids.has(task.id) && task.videoUrl)
+      .map((task) => task.videoUrl);
+    copyText(urls.join("\n"));
+    setStatus(urls.length ? `已复制 ${urls.length} 个视频 URL。` : "当前选择里没有可复制的视频 URL。");
+  }
+
+  function exportCsv() {
+    const params = new URLSearchParams(queryString);
+    const link = document.createElement("a");
+    link.href = `/api/tasks/export.csv?${params.toString()}`;
+    link.download = "";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  const selectedTask = detail?.task || tasks.find((task) => task.id === selectedTaskId);
+  const hasSelection = selectedIds.size > 0;
+
+  return (
+    <main className="task-center-page">
+      <header className="task-center-topbar">
+        <Link className="brand" to="/make">
+          <ProductLogo />
+          任务中心
+        </Link>
+        <div className="task-center-actions">
+          <span className="status-pill success">{me.user.email}</span>
+          <button className="secondary-button" type="button" onClick={() => navigate("/task-query")}>
+            <Search size={15} />
+            单 Task 查询
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/make")}>
+            返回制作
+          </button>
+        </div>
+      </header>
+
+      <section className="task-center-hero">
+        <div>
+          <p className="eyebrow">Task Center</p>
+          <h1>所有生成任务和结果</h1>
+          <p>用列表追踪每一次提交、上游 Task、失败原因和恢复动作。点击任意任务，右侧抽屉会显示完整结果。</p>
+        </div>
+        <div className="task-center-kpis">
+          <span><strong>{tasks.length}</strong>当前列表</span>
+          <span><strong>{tasks.filter((task) => task.status === "completed").length}</strong>已完成</span>
+          <span><strong>{tasks.filter((task) => task.status === "failed").length}</strong>失败</span>
+        </div>
+      </section>
+
+      <section className="task-center-layout">
+        <div className="task-center-main">
+          <div className="task-center-filters">
+            <div className="sidebar-search light">
+              <Search size={15} />
+              <input value={filters.q} onChange={(event) => patchFilter("q", event.target.value)} placeholder="搜索 Task ID / 上游 Task / URL / 项目" />
+            </div>
+            <select value={filters.status} onChange={(event) => patchFilter("status", event.target.value)}>
+              <option value="">全部状态</option>
+              <option value="queued">等待中</option>
+              <option value="submitted">已提交</option>
+              <option value="in_progress">生成中</option>
+              <option value="completed">已完成</option>
+              <option value="failed">失败</option>
+              <option value="cancelled">已取消</option>
+              <option value="expired">已过期</option>
+            </select>
+            <select value={filters.source} onChange={(event) => patchFilter("source", event.target.value)}>
+              <option value="">全部来源</option>
+              <option value="chat">对话</option>
+              <option value="canvas">画布</option>
+              <option value="test">测试任务</option>
+            </select>
+            <select value={filters.projectId} onChange={(event) => patchFilter("projectId", event.target.value)}>
+              <option value="">全部项目</option>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
+            <input type="date" value={filters.createdFrom} onChange={(event) => patchFilter("createdFrom", event.target.value)} />
+            <input type="date" value={filters.createdTo} onChange={(event) => patchFilter("createdTo", event.target.value)} />
+            <select value={filters.hasVideo} onChange={(event) => patchFilter("hasVideo", event.target.value)}>
+              <option value="">视频结果不限</option>
+              <option value="true">有视频结果</option>
+              <option value="false">无视频结果</option>
+            </select>
+            <select value={filters.failedOnly} onChange={(event) => patchFilter("failedOnly", event.target.value)}>
+              <option value="">失败不限</option>
+              <option value="true">只看失败</option>
+            </select>
+          </div>
+
+          <div className="task-center-toolbar">
+            <button className="secondary-button" type="button" onClick={loadTasks} disabled={busy}>
+              <RotateCcw size={15} />
+              刷新列表
+            </button>
+            <button className="secondary-button" type="button" onClick={() => refreshSelected("recoverable")} disabled={busy}>
+              批量重新拉取{hasSelection ? ` ${selectedIds.size}` : ""}
+            </button>
+            <button className="secondary-button" type="button" onClick={copyCompletedUrls}>
+              <Copy size={15} />
+              复制视频 URL
+            </button>
+            <button className="secondary-button" type="button" onClick={exportCsv}>
+              <Download size={15} />
+              导出 CSV
+            </button>
+            <button className="secondary-button" type="button" onClick={() => setFilters(defaultTaskFilters)}>
+              重置筛选
+            </button>
+            {status && <span className="task-center-status">{status}</span>}
+          </div>
+
+          <div className="task-center-table">
+            <div className="task-center-row head">
+              <button type="button" onClick={toggleAllVisible}>{selectedIds.size === tasks.length && tasks.length ? "取消" : "全选"}</button>
+              <span>任务</span>
+              <span>来源 / 项目</span>
+              <span>状态</span>
+              <span>时间</span>
+              <span>结果</span>
+              <span>操作</span>
+            </div>
+            {loading && <p className="muted task-center-empty">加载中...</p>}
+            {!loading && !tasks.length && <p className="muted task-center-empty">没有符合条件的任务。</p>}
+            {tasks.map((task) => (
+              <TaskCenterRow
+                key={task.id}
+                task={task}
+                selected={selectedTaskId === task.id}
+                checked={selectedIds.has(task.id)}
+                onCheck={() => toggleSelected(task.id)}
+                onOpen={() => setSelectedTaskId(task.id)}
+                onRefresh={() => refreshOne(task.id)}
+              />
+            ))}
+          </div>
+        </div>
+
+        <TaskCenterDrawer
+          task={selectedTask}
+          detail={detail}
+          loading={detailLoading}
+          busy={busy}
+          onClose={() => setSelectedTaskId("")}
+          onRefresh={refreshOne}
+          onNavigate={navigate}
+        />
+      </section>
+    </main>
+  );
+}
+
+function TaskCenterRow({ task, selected, checked, onCheck, onOpen, onRefresh }) {
+  const failed = task.status === "failed";
+  const hasVideo = Boolean(task.videoUrl || task.resultUrl);
+  return (
+    <article
+      className={cx("task-center-row", selected && "active", failed && "failed")}
+      role="button"
+      tabIndex={0}
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+    >
+      <span className="task-select" onClick={(event) => event.stopPropagation()}>
+        <input type="checkbox" checked={checked} onChange={onCheck} />
+      </span>
+      <span className="task-cell ids">
+        <TaskIdPill value={task.id} compact />
+        <TaskIdPill value={task.upstreamTaskId} label="上游 Task" compact />
+      </span>
+      <span className="task-cell">
+        <strong>{taskSourceLabel(task.source)}</strong>
+        <small>{task.projectName || task.projectId}</small>
+      </span>
+      <span className="task-cell status">
+        <i className={cx("dot", task.status)} />
+        <strong>{taskStatusLabel(task.status)}</strong>
+        <small>{task.progress ?? 0}%</small>
+      </span>
+      <span className="task-cell">
+        <strong>{task.updatedAt || task.createdAt}</strong>
+        <small>创建 {task.createdAt}</small>
+      </span>
+      <span className="task-cell result">
+        {hasVideo ? (
+          <strong>有结果</strong>
+        ) : failed ? (
+          <strong className="error-text">{task.error?.message || "失败"}</strong>
+        ) : (
+          <strong>等待结果</strong>
+        )}
+        <small>{task.videoUrl || task.resultUrl || "暂无 URL"}</small>
+      </span>
+      <span className="task-row-actions" onClick={(event) => event.stopPropagation()}>
+        {hasVideo && <button type="button" onClick={() => copyText(task.videoUrl || task.resultUrl)}>复制 URL</button>}
+        {["queued", "submitted", "in_progress", "failed"].includes(task.status) && <button type="button" onClick={onRefresh}>重新拉取</button>}
+      </span>
+    </article>
+  );
+}
+
+function TaskCenterDrawer({ task, detail, loading, busy, onClose, onRefresh, onNavigate }) {
+  if (!task) {
+    return (
+      <aside className="task-center-drawer empty">
+        <Search size={24} />
+        <strong>选择一个任务</strong>
+        <span>右侧会展示视频、失败原因、上游 Task、请求日志和恢复动作。</span>
+      </aside>
+    );
+  }
+  const currentTask = detail?.task || task;
+  const advice = taskRecoveryAdvice(currentTask);
+  const hasVideo = Boolean(currentTask.videoUrl || currentTask.resultUrl);
+  return (
+    <aside className="task-center-drawer">
+      <div className="drawer-title">
+        <div>
+          <strong>{taskStatusLabel(currentTask.status)}</strong>
+          <span>{taskSourceLabel(currentTask.source)} · {currentTask.projectName || currentTask.projectId}</span>
+        </div>
+        <button className="tool-button" type="button" onClick={onClose}>
+          <Check size={17} />
+        </button>
+      </div>
+      {loading && <p className="muted">正在加载详情...</p>}
+      {!loading && (
+        <>
+          <div className="drawer-video">
+            {currentTask.videoUrl ? (
+              <video src={currentTask.videoUrl} controls playsInline />
+            ) : (
+              <div>
+                <Video size={26} />
+                <span>{hasVideo ? "结果 URL 可复制，但暂无可播放视频" : "暂未拿到视频结果"}</span>
+              </div>
+            )}
+          </div>
+          <div className="drawer-id-stack">
+            <TaskIdPill value={currentTask.id} />
+            <TaskIdPill value={currentTask.upstreamTaskId} label="上游 Task" />
+          </div>
+          <div className={cx("recovery-card", advice.tone)}>
+            <strong>{advice.title}</strong>
+            <span>{advice.body}</span>
+            <div>
+              {advice.refresh && (
+                <button className="secondary-button" type="button" disabled={busy} onClick={() => onRefresh(currentTask.id)}>
+                  <RotateCcw size={15} />
+                  {advice.action}
+                </button>
+              )}
+              {advice.href && (
+                <button className="secondary-button" type="button" onClick={() => onNavigate(advice.href)}>
+                  {advice.action}
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="drawer-actions-grid">
+            <button className="secondary-button" type="button" onClick={() => onRefresh(currentTask.id)} disabled={busy}>
+              <RotateCcw size={15} />
+              重新拉取
+            </button>
+            <button className="secondary-button" type="button" disabled={!hasVideo} onClick={() => copyText(currentTask.videoUrl || currentTask.resultUrl || "")}>
+              <Copy size={15} />
+              复制结果 URL
+            </button>
+            <button className="secondary-button" type="button" onClick={() => onNavigate(`/task-query?taskId=${encodeURIComponent(currentTask.id)}`)}>
+              打开完整查询
+            </button>
+            <button className="secondary-button" type="button" disabled={!currentTask.projectId} onClick={() => onNavigate(`/app/projects/${currentTask.projectId}${currentTask.resultNodeId ? `?focus=${currentTask.resultNodeId}` : ""}`)}>
+              打开关联画布
+            </button>
+          </div>
+          <div className="drawer-meta-grid">
+            <InspectorKV label="Project ID" value={currentTask.projectId} />
+            <InspectorKV label="Source Node" value={currentTask.sourceNodeId} />
+            <InspectorKV label="Result Node" value={currentTask.resultNodeId} />
+            <InspectorKV label="创建时间" value={currentTask.createdAt} />
+            <InspectorKV label="更新时间" value={currentTask.updatedAt} />
+            <InspectorKV label="完成时间" value={currentTask.completedAt || "未完成"} />
+          </div>
+          {currentTask.error?.message && <div className="drawer-error"><AlertCircle size={18} />{currentTask.error.message}</div>}
+          <div className="drawer-log-list">
+            <h3>错误事件</h3>
+            {(detail?.events || []).map((event) => (
+              <div className="task-event-row error" key={event.eventId}>
+                <strong>{event.code}</strong>
+                <span>{event.message}</span>
+                <small>{event.createdAt} · {event.requestId}</small>
+              </div>
+            ))}
+            {!detail?.events?.length && <p className="muted">暂无错误事件。</p>}
+          </div>
+        </>
+      )}
+    </aside>
+  );
+}
+
 function RequireReady({ me, children }) {
   if (!me.user) return <Navigate to={`/login?next=${encodeURIComponent(window.location.pathname)}`} replace />;
   if (me.user.passwordResetRequired) return <Navigate to="/admin/reset-password" replace />;
   if (!me.user.apiKey?.configured) return <Navigate to={`/onboarding?next=${encodeURIComponent(window.location.pathname)}`} replace />;
+  return children;
+}
+
+function RequireUser({ me, children }) {
+  if (!me.user) return <Navigate to={`/login?next=${encodeURIComponent(window.location.pathname)}`} replace />;
+  if (me.user.passwordResetRequired) return <Navigate to="/admin/reset-password" replace />;
   return children;
 }
 
@@ -631,6 +1344,12 @@ function MakeHub({ me }) {
         </Link>
         <div className="make-actions">
           <span className="status-pill success">API key {me.user.apiKey.preview}</span>
+          <Link className="secondary-button" to="/profile">
+            个人信息
+          </Link>
+          <Link className="secondary-button" to="/tasks">
+            任务中心
+          </Link>
           <Link className="secondary-button" to="/logs">
             错误日志
           </Link>
@@ -801,6 +1520,10 @@ function ChatPage({ me }) {
     }
   }
 
+  function patchPlan(field, value) {
+    setPlan((current) => (current ? { ...current, [field]: value } : current));
+  }
+
   async function continueNext() {
     setBusy(true);
     try {
@@ -908,6 +1631,16 @@ function ChatPage({ me }) {
             <span>{statusCopy(pipelineStatus)} · 自然语言生成，随时发送到专业画布</span>
           </div>
           <div className="chat-top-actions">
+            <Link className="secondary-button" to="/task-query">
+              <Search size={15} />
+              Task 查询
+            </Link>
+            <Link className="secondary-button" to="/profile">
+              个人信息
+            </Link>
+            <Link className="secondary-button" to="/tasks">
+              任务中心
+            </Link>
             <button className="secondary-button" type="button" onClick={sendToCanvas}>
               发送到画布
             </button>
@@ -934,6 +1667,7 @@ function ChatPage({ me }) {
               onRefreshTask={refreshChatTask}
               errors={errorMessages}
               onGenerate={generate}
+              onPlanChange={patchPlan}
               canGenerate={Boolean(planActionable)}
               generating={busy && Boolean(planActionable)}
             />
@@ -990,21 +1724,6 @@ function statusCopy(status) {
   return map[status] || status;
 }
 
-function taskStatusLabel(status) {
-  const map = {
-    draft: "草稿",
-    submitting: "提交中",
-    submitted: "已提交",
-    queued: "等待中",
-    in_progress: "生成中",
-    completed: "已完成",
-    failed: "失败",
-    cancelled: "已取消",
-    expired: "已过期",
-  };
-  return map[status] || status || "未知";
-}
-
 function planFromEnvelope(envelope) {
   if (!envelope) return null;
   const body = envelope.plan ? envelope.plan : envelope;
@@ -1040,7 +1759,8 @@ function ChatWelcome({ setText }) {
   );
 }
 
-function GenerationPipeline({ prompt, plan, tasks, busy, onContinue, onSelectTask, onOpenLogs, onRefreshTask, errors, onGenerate, canGenerate, generating }) {
+function GenerationPipeline({ prompt, plan, tasks, busy, onContinue, onSelectTask, onOpenLogs, onRefreshTask, errors, onGenerate, onPlanChange, canGenerate, generating }) {
+  const submitted = ["submitted", "locked", "running", "completed"].includes(plan?.status) || Boolean(plan?.submittedTaskId);
   return (
     <section className="generation-pipeline">
       <PipelineStep index={1} title="输入创意" status={prompt ? "done" : "active"}>
@@ -1053,7 +1773,18 @@ function GenerationPipeline({ prompt, plan, tasks, busy, onContinue, onSelectTas
 
       <PipelineStep index={2} title="AI 解析" status={busy && !plan ? "active" : plan ? "done" : "idle"}>
         {busy && !plan && <ParsingCard />}
-        {plan && <PlanSummaryCard plan={plan} onGenerate={onGenerate} canGenerate={canGenerate} generating={generating} />}
+        {plan && (
+          <GenerationConfirmCard
+            value={plan}
+            onChange={onPlanChange}
+            onSubmit={onGenerate}
+            canSubmit={canGenerate}
+            submitting={generating}
+            submitted={submitted}
+            title="生成前参数确认"
+            submitLabel="确认参数并生成"
+          />
+        )}
         {!busy && !plan && <p className="pipeline-hint">等待解析提示词。</p>}
       </PipelineStep>
 
@@ -1125,6 +1856,129 @@ function ParsingCard() {
   );
 }
 
+function GenerationConfirmCard({ value, onChange, onSubmit, canSubmit = true, submitting = false, submitted = false, title = "参数确认", submitLabel = "确认并提交生成" }) {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [templateSaved, setTemplateSaved] = useState(false);
+  if (!value) return null;
+  const promptField = Object.prototype.hasOwnProperty.call(value, "modelPrompt") || value.displayPrompt ? "modelPrompt" : "prompt";
+  const prompt = value[promptField] || value.prompt || value.displayPrompt || "";
+  const patch = (field, nextValue) => onChange?.(field, nextValue);
+  const readonly = submitted;
+  function saveTemplate() {
+    localStorage.setItem("last_generation_template", JSON.stringify(value));
+    setTemplateSaved(true);
+    setTimeout(() => setTemplateSaved(false), 1400);
+  }
+
+  return (
+    <section className={cx("generation-confirm-card", readonly && "readonly")}>
+      <div className="confirm-header">
+        <div>
+          <strong>{title}</strong>
+          <span>{readonly ? "已提交，上游任务会继续追踪" : "确认这次会生成什么，再提交给上游"}</span>
+        </div>
+        <span className="status-pill">{value.model || defaultModel}</span>
+      </div>
+      <label>
+        Prompt
+        <textarea value={prompt} readOnly={readonly} onChange={(event) => patch(promptField, event.target.value)} />
+      </label>
+      <label>
+        Negative Prompt
+        <input value={value.negativePrompt || ""} readOnly={readonly} onChange={(event) => patch("negativePrompt", event.target.value)} placeholder="不想出现的元素" />
+      </label>
+      <div className="confirm-grid">
+        <label>
+          模型
+          <input value={value.model || defaultModel} readOnly={readonly} onChange={(event) => patch("model", event.target.value)} />
+        </label>
+        <label>
+          时长
+          <select value={value.duration || 5} disabled={readonly} onChange={(event) => patch("duration", Number(event.target.value))}>
+            {durationOptions.map((item) => <option key={item} value={item}>{item}s</option>)}
+          </select>
+        </label>
+        <label>
+          比例
+          <select value={value.ratio || "16:9"} disabled={readonly} onChange={(event) => patch("ratio", event.target.value)}>
+            {ratioOptions.map((item) => <option key={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>
+          分辨率
+          <select value={value.resolution || "720p"} disabled={readonly} onChange={(event) => patch("resolution", event.target.value)}>
+            <option value="720p">720p</option>
+            <option value="1080p">1080p</option>
+          </select>
+        </label>
+        <label>
+          镜头运动
+          <select value={value.cameraMotion || "slow_push_in"} disabled={readonly} onChange={(event) => patch("cameraMotion", event.target.value)}>
+            {motionOptions.map(([motionValue, label]) => <option key={motionValue} value={motionValue}>{label}</option>)}
+          </select>
+        </label>
+        <label>
+          运动强度
+          <select value={value.motionStrength || "medium"} disabled={readonly} onChange={(event) => patch("motionStrength", event.target.value)}>
+            {strengthOptions.map(([strengthValue, label]) => <option key={strengthValue} value={strengthValue}>{label}</option>)}
+          </select>
+        </label>
+      </div>
+      <button className="confirm-advanced-toggle" type="button" onClick={() => setAdvancedOpen((open) => !open)}>
+        {advancedOpen ? "收起高级参数" : "展开高级参数"}
+      </button>
+      {advancedOpen && (
+        <div className="confirm-advanced">
+          <label>
+            参考图 URL
+            <input value={value.referenceImageUrl || ""} readOnly={readonly} onChange={(event) => patch("referenceImageUrl", event.target.value)} placeholder="https://..." />
+          </label>
+          <label>
+            首帧 URL
+            <input value={value.firstFrameUrl || ""} readOnly={readonly} onChange={(event) => patch("firstFrameUrl", event.target.value)} placeholder="https://..." />
+          </label>
+          <label>
+            尾帧 URL
+            <input value={value.lastFrameUrl || ""} readOnly={readonly} onChange={(event) => patch("lastFrameUrl", event.target.value)} placeholder="https://..." />
+          </label>
+          <label>
+            Seed
+            <input value={value.seed || ""} readOnly={readonly} onChange={(event) => patch("seed", event.target.value)} placeholder="可留空" />
+          </label>
+          <div className="confirm-toggles">
+            <label>
+              <input type="checkbox" checked={Boolean(value.generateAudio)} disabled={readonly} onChange={(event) => patch("generateAudio", event.target.checked)} />
+              生成音频
+            </label>
+            <label>
+              <input type="checkbox" checked={Boolean(value.watermark)} disabled={readonly} onChange={(event) => patch("watermark", event.target.checked)} />
+              水印
+            </label>
+          </div>
+        </div>
+      )}
+      <div className="confirm-actions">
+        {readonly ? (
+          <div className="readonly-status">
+            <Lock size={15} />
+            参数已提交，结果会在任务卡和任务中心持续更新。
+          </div>
+        ) : (
+          <>
+            <button className="secondary-button" type="button" onClick={saveTemplate}>
+              {templateSaved ? "模板已保存" : "保存为模板"}
+            </button>
+            <button className="hero-primary glow-action" type="button" disabled={!canSubmit || submitting} onClick={onSubmit}>
+              {submitting ? <Loader2 className="spin" size={16} /> : <WandSparkles size={16} />}
+              {submitting ? "正在提交生成" : submitLabel}
+            </button>
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function PlanSummaryCard({ plan, onGenerate, canGenerate, generating }) {
   if (!plan) return null;
   const submitted = ["submitted", "locked", "running", "completed"].includes(plan.status) || Boolean(plan.submittedTaskId);
@@ -1166,7 +2020,8 @@ function TaskChatCard({ task, index, onDebug, onRefresh, onContinue, onSelect })
       <div className="task-card-head">
         <div>
           <strong>Clip {index + 1}</strong>
-          <small>{task.id}</small>
+          <TaskIdPill value={task.id} compact />
+          <TaskIdPill value={task.upstreamTaskId} label="上游 Task" compact />
         </div>
         <span>{taskStatusLabel(task.status)} · {task.progress ?? 0}%</span>
       </div>
@@ -1191,10 +2046,6 @@ function TaskChatCard({ task, index, onDebug, onRefresh, onContinue, onSelect })
       )}
       <div className="task-actions">
         {done && <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onContinue(); }}>续写下一段</button>}
-        <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); copyText(task.id); }}>
-          <Copy size={15} />
-          复制 Task ID
-        </button>
         {failed && (
           <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onRefresh?.(task.id); }}>
             <RotateCcw size={15} />
@@ -1307,18 +2158,15 @@ function ResultInspector({ tab, setTab, task, currentVideo, plan, tasks, taskQue
               <button className={cx("task-row", item.id === task?.id && "active")} key={item.id} type="button" onClick={() => onSelectTask(item.id)}>
                 <span>Clip {index + 1}</span>
                 <small>{taskStatusLabel(item.status)} · {item.progress ?? 0}%</small>
+                <code>{item.id}</code>
               </button>
             ))}
           </div>
           {task && (
             <div className="task-trace-panel">
-              <InspectorKV label="本地任务" value={task.id} />
+              <TaskIdPill value={task.id} />
               <InspectorKV label="上游任务" value={task.upstreamTaskId || "等待提交"} />
               <InspectorKV label="状态" value={taskStatusLabel(task.status)} />
-              <button className="secondary-button" type="button" onClick={() => copyText(task.id)}>
-                <Copy size={15} />
-                复制 Task ID
-              </button>
               <button className="secondary-button" type="button" onClick={() => onOpenLogs(task.id)}>
                 打开完整日志
               </button>
@@ -1426,6 +2274,210 @@ function LogsPage({ me }) {
       </section>
       {selected && <ErrorLogModal event={selected} onClose={() => setSelected(null)} />}
     </main>
+  );
+}
+
+function TaskQueryPage({ me }) {
+  const navigate = useNavigate();
+  const initialTaskId = new URLSearchParams(window.location.search).get("taskId") || "";
+  const [taskId, setTaskId] = useState(initialTaskId);
+  const [detail, setDetail] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [lastQuery, setLastQuery] = useState("");
+
+  const query = useCallback(async (event, explicitTaskId = taskId) => {
+    event?.preventDefault?.();
+    const value = String(explicitTaskId || "").trim();
+    if (!value) return;
+    setBusy(true);
+    setLastQuery(value);
+    try {
+      const result = await api(`/api/task-query/${encodeURIComponent(value)}`);
+      setDetail(result);
+      window.history.replaceState(null, "", `/task-query?taskId=${encodeURIComponent(value)}`);
+    } catch (error) {
+      setDetail({ error: error.body || { message: error.message } });
+    } finally {
+      setBusy(false);
+    }
+  }, [taskId]);
+
+  useEffect(() => {
+    if (initialTaskId) query(null, initialTaskId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <main className="task-query-page">
+      <header className="task-query-topbar">
+        <Link className="brand" to="/make">
+          <ProductLogo />
+          Task 查询
+        </Link>
+        <div className="task-query-actions">
+          <span className="status-pill success">{me.user.email}</span>
+          <button className="secondary-button" type="button" onClick={() => navigate("/make")}>
+            返回制作
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/tasks")}>
+            任务中心
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/app")}>
+            专业画布
+          </button>
+        </div>
+      </header>
+
+      <section className="task-query-hero">
+        <div>
+          <p className="eyebrow">Task Lookup</p>
+          <h1>用 Task ID 查询生成结果</h1>
+          <p>输入本地 Task ID 或上游 Task ID。查询会刷新一次上游状态，并把视频、进度、错误和请求轨迹集中展示。</p>
+        </div>
+        <form className="task-query-form" onSubmit={query}>
+          <label>
+            Task ID
+            <input value={taskId} onChange={(event) => setTaskId(event.target.value)} placeholder="task_... 或上游 task id" autoFocus />
+          </label>
+          <button className="hero-primary" type="submit" disabled={busy || !taskId.trim()}>
+            {busy ? <Loader2 className="spin" size={16} /> : <Search size={16} />}
+            {busy ? "正在查询" : "查询生成结果"}
+          </button>
+        </form>
+      </section>
+
+      {!detail && (
+        <section className="task-query-empty">
+          <Search size={28} />
+          <strong>等待输入 Task ID</strong>
+          <span>查询后会在这里显示视频结果、任务状态、错误事件和轻量请求日志。</span>
+        </section>
+      )}
+
+      {detail?.error && (
+        <section className="task-query-error">
+          <AlertCircle size={22} />
+          <div>
+            <strong>没有查到这个任务</strong>
+            <span>{detail.error?.error?.message || detail.error?.message || "请确认 Task ID 是否属于当前账号。"}</span>
+            {lastQuery && <code>{lastQuery}</code>}
+          </div>
+        </section>
+      )}
+
+      {detail?.task && <TaskQueryResult detail={detail} onRefresh={(id) => query(null, id)} />}
+    </main>
+  );
+}
+
+function TaskQueryResult({ detail, onRefresh }) {
+  const task = detail.task;
+  const hasResultUrl = Boolean(task.videoUrl || task.resultUrl);
+  return (
+    <section className="task-query-result">
+      <div className="task-result-main">
+        <div className="task-result-video">
+          {task.videoUrl ? (
+            <video src={task.videoUrl} controls playsInline />
+          ) : (
+            <div className="task-result-placeholder">
+              <Video size={30} />
+              <span>{task.status === "completed" ? "任务完成但没有返回视频 URL" : "暂未拿到视频结果"}</span>
+            </div>
+          )}
+        </div>
+        <div className="task-result-summary">
+          <div className="task-result-status">
+            <span className={cx("dot", task.status)} />
+            <div>
+              <strong>{taskStatusLabel(task.status)}</strong>
+              <small>{task.progress ?? 0}% · 更新于 {task.updatedAt || "未知"}</small>
+            </div>
+          </div>
+          <div className="progress-track task-result-progress">
+            <span style={{ width: `${task.progress ?? 0}%` }} />
+          </div>
+          <div className="task-result-id-grid">
+            <TaskIdPill value={task.id} />
+            <TaskIdPill value={task.upstreamTaskId} label="上游 Task" />
+          </div>
+          <div className="task-result-buttons">
+            <button className="secondary-button" type="button" onClick={() => onRefresh?.(task.id)}>
+              <RotateCcw size={15} />
+              重新刷新
+            </button>
+            <button className="secondary-button" type="button" disabled={!hasResultUrl} onClick={() => copyText(task.videoUrl || task.resultUrl || "")}>
+              <Copy size={15} />
+              复制结果 URL
+            </button>
+          </div>
+          {task.error?.message && (
+            <div className="task-query-error inline">
+              <AlertCircle size={18} />
+              <span>{task.error.message}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="task-result-details">
+        <section>
+          <h2>任务信息</h2>
+          <div className="task-info-grid">
+            <InspectorKV label="Project ID" value={task.projectId} />
+            <InspectorKV label="Source Node" value={task.sourceNodeId} />
+            <InspectorKV label="Result Node" value={task.resultNodeId} />
+            <InspectorKV label="Last Frame Asset" value={task.lastFrameAssetId || "无"} />
+            <InspectorKV label="创建时间" value={task.createdAt} />
+            <InspectorKV label="完成时间" value={task.completedAt || "未完成"} />
+          </div>
+        </section>
+
+        <section>
+          <h2>结果 URL</h2>
+          <div className="url-copy-list">
+            <button type="button" disabled={!task.videoUrl} onClick={() => copyText(task.videoUrl)}>
+              <span>Video URL</span>
+              <code>{task.videoUrl || "暂无"}</code>
+              <Copy size={15} />
+            </button>
+            <button type="button" disabled={!task.resultUrl} onClick={() => copyText(task.resultUrl)}>
+              <span>Result URL</span>
+              <code>{task.resultUrl || "暂无"}</code>
+              <Copy size={15} />
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <h2>错误事件</h2>
+          <div className="task-event-list">
+            {(detail.events || []).map((event) => (
+              <div className="task-event-row error" key={event.eventId}>
+                <strong>{event.code}</strong>
+                <span>{event.message}</span>
+                <small>{event.createdAt} · {event.requestId}</small>
+              </div>
+            ))}
+            {!detail.events?.length && <p className="muted">暂无错误事件。</p>}
+          </div>
+        </section>
+
+        <section>
+          <h2>请求轨迹</h2>
+          <div className="task-event-list">
+            {(detail.logs || []).map((log) => (
+              <div className={cx("task-event-row", log.hasError && "error")} key={log.id}>
+                <strong>{log.action}</strong>
+                <span>{log.message || taskStatusLabel(log.status)}</span>
+                <small>{log.createdAt} · {log.requestId}</small>
+              </div>
+            ))}
+            {!detail.logs?.length && <p className="muted">暂无轻量请求日志。</p>}
+          </div>
+        </section>
+      </div>
+    </section>
   );
 }
 
@@ -1732,8 +2784,8 @@ function TaskResultDrawer({ detail, onClose, onRefresh }) {
           <>
             {task?.videoUrl && <video className="drawer-video" src={task.videoUrl} controls playsInline />}
             <div className="drawer-grid">
-              <InspectorKV label="Task ID" value={task?.id} />
-              <InspectorKV label="上游 Task" value={task?.upstreamTaskId || "无"} />
+              <TaskIdPill value={task?.id} className="drawer-task-id" />
+              <TaskIdPill value={task?.upstreamTaskId} label="上游 Task" className="drawer-task-id" />
               <InspectorKV label="用户" value={task?.userEmail || task?.userId} />
               <InspectorKV label="项目" value={task?.projectId} />
               <InspectorKV label="结果节点" value={task?.resultNodeId} />
@@ -1950,6 +3002,8 @@ function RenderNode({ id, data, selected }) {
         </span>
         <strong>{data.title || "视频结果"}</strong>
       </div>
+      <TaskIdPill value={data.taskId} compact className="node-task-id nodrag" />
+      <TaskIdPill value={data.upstreamTaskId} label="上游 Task" compact className="node-task-id nodrag" />
       {!done && !failed && (
         <div className="render-progress">
           <div className="shimmer-frame">
@@ -1980,11 +3034,6 @@ function RenderNode({ id, data, selected }) {
             续写下一段
           </button>
         )}
-        {data.taskId && (
-          <button className="node-ghost nodrag" type="button" onClick={() => copyText(data.taskId)}>
-            <Copy size={15} />
-          </button>
-        )}
         {failed && data.taskId && (
           <button className="node-ghost nodrag" type="button" onClick={() => actions.refreshTask?.(data.taskId)}>
             <RotateCcw size={15} />
@@ -1994,6 +3043,11 @@ function RenderNode({ id, data, selected }) {
         <button className="node-ghost nodrag" type="button" onClick={() => actions.showDebug?.(data.taskId, data.eventId)}>
           完整日志
         </button>
+        {data.taskId && (
+          <button className="node-ghost nodrag" type="button" onClick={() => { window.location.href = `/task-query?taskId=${encodeURIComponent(data.taskId)}`; }}>
+            Task 查询
+          </button>
+        )}
       </div>
       <Handle type="source" position={Position.Right} />
     </article>
@@ -2158,6 +3212,7 @@ function Studio({ me, projects, projectId }) {
   const [query, setQuery] = useState("");
   const [debugModal, setDebugModal] = useState(null);
   const [sequenceClip, setSequenceClip] = useState(0);
+  const [confirmNodeId, setConfirmNodeId] = useState("");
   const loadedRef = useRef(false);
   const saveTimerRef = useRef(null);
   const skipNextAutosaveRef = useRef(false);
@@ -2171,7 +3226,7 @@ function Studio({ me, projects, projectId }) {
           current.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, ...patch } } : node)),
         );
       },
-      generate: async (nodeId) => generateFromNode(nodeId),
+      generate: (nodeId) => requestGenerateFromNode(nodeId),
       continueFrom: async (nodeId) => continueFromRender(nodeId),
       duplicate: (nodeId) => duplicateNode(nodeId),
       showDebug: async (taskId, eventId) => showDebug(taskId, eventId),
@@ -2191,6 +3246,7 @@ function Studio({ me, projects, projectId }) {
   );
 
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
+  const confirmNode = nodes.find((node) => node.id === confirmNodeId);
   const runningCount = nodes.filter((node) => node.type === "render" && ["queued", "in_progress"].includes(node.data?.status)).length;
   const completedClips = useMemo(
     () => orderSequenceClips(nodes, edges),
@@ -2205,6 +3261,11 @@ function Studio({ me, projects, projectId }) {
         setNodes(result.nodes || []);
         setEdges(result.edges || []);
         setViewport(result.viewport || { x: 0, y: 0, zoom: 1 });
+        const focusNodeId = new URLSearchParams(window.location.search).get("focus");
+        if (focusNodeId && (result.nodes || []).some((node) => node.id === focusNodeId)) {
+          setSelectedNodeId(focusNodeId);
+          setTimeout(() => reactFlow.fitView({ nodes: [{ id: focusNodeId }], padding: 0.45, duration: 500 }), 90);
+        }
         setTimeout(() => reactFlow.setViewport(result.viewport || { x: 0, y: 0, zoom: 1 }), 50);
       })
       .finally(() => {
@@ -2402,11 +3463,30 @@ function Studio({ me, projects, projectId }) {
     setSelectedNodeId(null);
   }
 
+  function requestGenerateFromNode(nodeId) {
+    const node = nodes.find((item) => item.id === nodeId);
+    if (!node) return;
+    if (node.type === "shot") {
+      setConfirmNodeId(nodeId);
+      setSelectedNodeId(nodeId);
+      return;
+    }
+    generateFromNode(nodeId);
+  }
+
+  function patchConfirmNode(field, value) {
+    if (!confirmNodeId) return;
+    setNodes((current) =>
+      current.map((node) => (node.id === confirmNodeId ? { ...node, data: { ...node.data, [field]: value } } : node)),
+    );
+  }
+
   async function generateFromNode(nodeId) {
     const node = nodes.find((item) => item.id === nodeId);
     if (!node) return;
     if (node.data?.status === "submitting" || submittingNodeIdsRef.current.has(nodeId)) return;
     submittingNodeIdsRef.current.add(nodeId);
+    setConfirmNodeId("");
     setNodes((current) =>
       current.map((item) => (item.id === nodeId ? { ...item, data: { ...item.data, status: "submitting" } } : item)),
     );
@@ -2552,6 +3632,16 @@ function Studio({ me, projects, projectId }) {
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索 prompt / task / URL" />
         </div>
         <div className="topbar-right">
+          <button className="secondary-button" type="button" onClick={() => navigate("/task-query")}>
+            <Search size={15} />
+            Task 查询
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/profile")}>
+            个人信息
+          </button>
+          <button className="secondary-button" type="button" onClick={() => navigate("/tasks")}>
+            任务中心
+          </button>
           <span className="status-pill">{runningCount} 个运行中</span>
           <button className="secondary-button" type="button" onClick={() => navigate("/make")}>
             立即制作
@@ -2609,7 +3699,7 @@ function Studio({ me, projects, projectId }) {
         </ReactFlow>
       </section>
 
-      <PropertyPanel node={selectedNode} onPatch={actionHandlers.patchNode} onGenerate={generateFromNode} onContinue={continueFromRender} onRefreshTask={refreshTaskResult} />
+      <PropertyPanel node={selectedNode} onPatch={actionHandlers.patchNode} onGenerate={requestGenerateFromNode} onContinue={continueFromRender} onRefreshTask={refreshTaskResult} />
       <SequenceBar clips={completedClips} activeIndex={sequenceClip} setActiveIndex={setSequenceClip} />
 
       {contextMenu && (
@@ -2621,12 +3711,20 @@ function Studio({ me, projects, projectId }) {
           onAddAsset={() => addAssetAt(contextMenu.position)}
           onDuplicate={() => contextMenu.nodeId && duplicateNode(contextMenu.nodeId)}
           onDelete={() => contextMenu.nodeId && deleteNode(contextMenu.nodeId)}
-          onGenerate={() => contextMenu.nodeId && generateFromNode(contextMenu.nodeId)}
+          onGenerate={() => contextMenu.nodeId && requestGenerateFromNode(contextMenu.nodeId)}
           onContinue={() => contextMenu.nodeId && continueFromRender(contextMenu.nodeId)}
           onDebug={() => {
             const node = nodes.find((item) => item.id === contextMenu.nodeId);
             showDebug(node?.data?.taskId);
           }}
+        />
+      )}
+      {confirmNode && (
+        <GenerationConfirmModal
+          node={confirmNode}
+          onChange={patchConfirmNode}
+          onClose={() => setConfirmNodeId("")}
+          onSubmit={() => generateFromNode(confirmNode.id)}
         />
       )}
       {debugModal && <DebugModal detail={debugModal} onClose={() => setDebugModal(null)} />}
@@ -2750,17 +3848,17 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
           </div>
           {data.taskId && (
             <div className="task-trace-panel compact-panel">
-              <InspectorKV label="Task ID" value={data.taskId} />
-              <button className="secondary-button" type="button" onClick={() => copyText(data.taskId)}>
-                <Copy size={15} />
-                复制 Task ID
-              </button>
-              {data.status === "failed" && (
+              <TaskIdPill value={data.taskId} />
+              <TaskIdPill value={data.upstreamTaskId} label="上游 Task" />
+              {["failed", "queued", "submitted", "in_progress"].includes(data.status) && (
                 <button className="secondary-button" type="button" onClick={() => onRefreshTask?.(data.taskId)}>
                   <RotateCcw size={15} />
                   重新拉取结果
                 </button>
               )}
+              <button className="secondary-button" type="button" onClick={() => { window.location.href = `/task-query?taskId=${encodeURIComponent(data.taskId)}`; }}>
+                打开 Task 查询
+              </button>
             </div>
           )}
           {data.videoUrl && (
@@ -2838,6 +3936,7 @@ function ContextMenu({ menu, node, onAddShot, onAddNote, onAddAsset, onDuplicate
 
 function SequenceBar({ clips, activeIndex, setActiveIndex }) {
   const [playing, setPlaying] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
   const videoRef = useRef(null);
   const activeClip = clips[activeIndex];
 
@@ -2860,10 +3959,12 @@ function SequenceBar({ clips, activeIndex, setActiveIndex }) {
     navigator.clipboard?.writeText(clips.map((clip) => clip.data.videoUrl).join("\n"));
   }
 
+  if (!clips.length) return null;
+
   return (
-    <footer className="sequence-bar">
+    <footer className={cx("sequence-bar", collapsed && "collapsed")}>
       <div className="sequence-player">
-        <button className="tool-button" type="button" disabled={!clips.length} onClick={() => setPlaying((value) => !value)}>
+        <button className="tool-button" type="button" onClick={() => setPlaying((value) => !value)}>
           {playing ? <Pause size={17} /> : <Play size={17} />}
         </button>
         <div>
@@ -2871,33 +3972,64 @@ function SequenceBar({ clips, activeIndex, setActiveIndex }) {
           <span>{clips.length} 个片段</span>
         </div>
       </div>
-      {activeClip && (
-        <video
-          ref={videoRef}
-          src={activeClip.data.videoUrl}
-          muted
-          playsInline
-          onEnded={nextClip}
-          className="sequence-video"
-          controls
-        />
-      )}
-      <div className="clip-strip">
-        {clips.map((clip, index) => (
-          <button
-            key={clip.id}
-            className={cx("clip-chip", index === activeIndex && "active")}
-            type="button"
-            onClick={() => setActiveIndex(index)}
-          >
-            Clip {index + 1}
+      {!collapsed && (
+        <>
+          {activeClip && (
+            <video
+              ref={videoRef}
+              src={activeClip.data.videoUrl}
+              muted
+              playsInline
+              onEnded={nextClip}
+              className="sequence-video"
+              controls
+            />
+          )}
+          <div className="clip-strip">
+            {clips.map((clip, index) => (
+              <button
+                key={clip.id}
+                className={cx("clip-chip", index === activeIndex && "active")}
+                type="button"
+                onClick={() => setActiveIndex(index)}
+              >
+                Clip {index + 1}
+              </button>
+            ))}
+          </div>
+          <button className="secondary-button" type="button" onClick={copyUrls}>
+            复制 URL
           </button>
-        ))}
-      </div>
-      <button className="secondary-button" type="button" disabled={!clips.length} onClick={copyUrls}>
-        复制 URL
+        </>
+      )}
+      <button className="secondary-button sequence-toggle" type="button" onClick={() => setCollapsed((value) => !value)}>
+        {collapsed ? "展开" : "收起"}
       </button>
     </footer>
+  );
+}
+
+function GenerationConfirmModal({ node, onChange, onClose, onSubmit }) {
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section className="generation-confirm-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <strong>生成前参数确认</strong>
+            <span>{node.data?.title || node.id}</span>
+          </div>
+          <button className="tool-button" type="button" onClick={onClose}>
+            <Check size={17} />
+          </button>
+        </div>
+        <GenerationConfirmCard
+          value={node.data || {}}
+          onChange={onChange}
+          onSubmit={onSubmit}
+          submitLabel="确认并生成这个镜头"
+        />
+      </section>
+    </div>
   );
 }
 
@@ -2945,9 +4077,12 @@ function AppRoutes() {
       <Route path="/admin/requests" element={<RequireAdmin me={me}><AdminRequestsPage me={me} /></RequireAdmin>} />
       <Route path="/admin/task-query" element={<RequireAdmin me={me}><AdminTaskQueryPage me={me} /></RequireAdmin>} />
       <Route path="/onboarding" element={<Onboarding me={me} reload={me.reload} />} />
+      <Route path="/profile" element={<RequireUser me={me}><ProfilePage me={me} reload={me.reload} /></RequireUser>} />
+      <Route path="/tasks" element={<RequireReady me={me}><TaskCenterPage me={me} /></RequireReady>} />
       <Route path="/make" element={<RequireReady me={me}><MakeHub me={me} /></RequireReady>} />
       <Route path="/make/chat" element={<RequireReady me={me}><ChatPage me={me} /></RequireReady>} />
       <Route path="/make/chat/:sessionId" element={<RequireReady me={me}><ChatPage me={me} /></RequireReady>} />
+      <Route path="/task-query" element={<RequireReady me={me}><TaskQueryPage me={me} /></RequireReady>} />
       <Route path="/logs" element={<RequireReady me={me}><LogsPage me={me} /></RequireReady>} />
       <Route path="/app" element={<StudioGate me={me} />} />
       <Route path="/app/projects/:projectId" element={<StudioGate me={me} />} />

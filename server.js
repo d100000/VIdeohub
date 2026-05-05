@@ -10,6 +10,12 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  parseTaskListFilters,
+  taskListWhere,
+  taskSourceLabel,
+  tasksToCsv,
+} from "./lib/task-center-utils.js";
 
 dotenv.config();
 
@@ -270,6 +276,13 @@ function migrate() {
   `);
   ensureColumn("users", "is_admin", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn("users", "must_reset_password", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("generation_tasks", "source", "TEXT NOT NULL DEFAULT 'canvas'");
+  db.exec(`
+    UPDATE generation_tasks
+    SET source = 'chat'
+    WHERE source = 'canvas'
+      AND id IN (SELECT task_id FROM creation_session_tasks);
+  `);
 }
 
 migrate();
@@ -342,7 +355,19 @@ const statements = {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   taskById: db.prepare("SELECT * FROM generation_tasks WHERE id = ?"),
-  taskForUser: db.prepare("SELECT * FROM generation_tasks WHERE id = ? AND user_id = ?"),
+  taskForUser: db.prepare(`
+    SELECT generation_tasks.*, projects.name AS project_name
+    FROM generation_tasks
+    LEFT JOIN projects ON projects.id = generation_tasks.project_id
+    WHERE generation_tasks.id = ? AND generation_tasks.user_id = ?
+  `),
+  taskLookupForUser: db.prepare(`
+    SELECT generation_tasks.*, projects.name AS project_name
+    FROM generation_tasks
+    LEFT JOIN projects ON projects.id = generation_tasks.project_id
+    WHERE generation_tasks.user_id = ? AND (generation_tasks.id = ? OR generation_tasks.upstream_task_id = ?)
+    LIMIT 1
+  `),
   updateTaskSubmitted: db.prepare(`
     UPDATE generation_tasks
     SET upstream_task_id = ?, status = ?, progress = ?, response_json = ?, debug_json = ?, updated_at = CURRENT_TIMESTAMP
@@ -360,6 +385,7 @@ const statements = {
     SET status = 'failed', error_json = ?, debug_json = ?, updated_at = CURRENT_TIMESTAMP
     WHERE id = ?
   `),
+  updateTaskSource: db.prepare("UPDATE generation_tasks SET source = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"),
   createAsset: db.prepare(`
     INSERT INTO assets (id, project_id, user_id, type, source, url, file_path, metadata_json)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -371,6 +397,16 @@ const statements = {
     LEFT JOIN canvas_nodes ON canvas_nodes.id = generation_tasks.result_node_id
     WHERE generation_tasks.project_id = ? AND generation_tasks.status = 'completed' AND generation_tasks.video_url IS NOT NULL
     ORDER BY canvas_nodes.x ASC, generation_tasks.created_at ASC
+  `),
+  tasksForUserHistory: db.prepare(`
+    SELECT generation_tasks.*, projects.name AS project_name
+    FROM generation_tasks
+    LEFT JOIN projects ON projects.id = generation_tasks.project_id
+    WHERE generation_tasks.user_id = ?
+      AND (? = '' OR generation_tasks.id LIKE ? OR generation_tasks.upstream_task_id LIKE ? OR generation_tasks.video_url LIKE ?)
+      AND (? = '' OR generation_tasks.status = ?)
+    ORDER BY generation_tasks.created_at DESC
+    LIMIT ?
   `),
   createCreationSession: db.prepare(`
     INSERT INTO creation_sessions (id, user_id, title, linked_project_id)
@@ -408,7 +444,8 @@ const statements = {
   `),
   sessionTasks: db.prepare(`
     SELECT creation_session_tasks.*, generation_tasks.status, generation_tasks.video_url, generation_tasks.progress,
-      generation_tasks.result_node_id, generation_tasks.source_node_id, generation_tasks.upstream_task_id
+      generation_tasks.result_node_id, generation_tasks.source_node_id, generation_tasks.upstream_task_id,
+      generation_tasks.error_json, generation_tasks.source
     FROM creation_session_tasks
     JOIN generation_tasks ON generation_tasks.id = creation_session_tasks.task_id
     WHERE creation_session_tasks.session_id = ?
@@ -472,6 +509,15 @@ const statements = {
   errorEventForUser: db.prepare("SELECT * FROM error_events WHERE id = ? AND user_id = ?"),
   patchErrorEvent: db.prepare("UPDATE error_events SET resolved_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id = ? AND user_id = ?"),
   errorEventsForTask: db.prepare("SELECT * FROM error_events WHERE task_id = ? AND user_id = ? ORDER BY created_at DESC"),
+  requestLogsForUserTask: db.prepare(`
+    SELECT request_logs.*, generation_tasks.status AS task_status,
+      generation_tasks.video_url, generation_tasks.result_url, generation_tasks.upstream_task_id
+    FROM request_logs
+    LEFT JOIN generation_tasks ON generation_tasks.id = request_logs.task_id
+    WHERE request_logs.task_id = ? AND request_logs.user_id = ?
+    ORDER BY request_logs.created_at DESC
+    LIMIT 50
+  `),
   adminErrorEventsForTask: db.prepare("SELECT * FROM error_events WHERE task_id = ? ORDER BY created_at DESC"),
   adminRequestLogsForTask: db.prepare("SELECT * FROM request_logs WHERE task_id = ? ORDER BY created_at DESC LIMIT 50"),
   adminTaskById: db.prepare(`
@@ -1545,6 +1591,8 @@ function taskResponse(task) {
   return {
     id: task.id,
     projectId: task.project_id,
+    projectName: task.project_name || "",
+    source: task.source || "canvas",
     sourceNodeId: task.source_node_id,
     resultNodeId: task.result_node_id,
     upstreamTaskId: task.upstream_task_id,
@@ -1592,6 +1640,42 @@ function adminTaskResponse(task) {
     userId: task.user_id,
     userEmail: task.user_email || "",
   };
+}
+
+function taskHistoryResponse(task) {
+  return {
+    ...taskResponse(task),
+    projectName: task.project_name || "",
+    errorCount: task.error_count ?? 0,
+  };
+}
+
+function listTasksForUser(userId, filters) {
+  const { where, params } = taskListWhere(filters);
+  return db.prepare(`
+    SELECT generation_tasks.*, projects.name AS project_name,
+      (SELECT COUNT(*) FROM error_events WHERE error_events.task_id = generation_tasks.id) AS error_count
+    FROM generation_tasks
+    LEFT JOIN projects ON projects.id = generation_tasks.project_id
+    WHERE ${where}
+    ORDER BY generation_tasks.updated_at DESC, generation_tasks.created_at DESC
+    LIMIT @limit OFFSET @offset
+  `).all({ ...params, userId });
+}
+
+function taskCenterResponse(row) {
+  return {
+    ...taskHistoryResponse(row),
+    sourceLabel: taskSourceLabel(row.source),
+  };
+}
+
+function ensureUtilityProject(userId, name = "API key 测试") {
+  const existing = db.prepare("SELECT * FROM projects WHERE user_id = ? AND name = ? ORDER BY created_at ASC LIMIT 1").get(userId, name);
+  if (existing) return existing;
+  const projectId = id("project");
+  statements.createProject.run(projectId, userId, name);
+  return statements.projectById.get(projectId, userId);
 }
 
 ensureAdminAccount();
@@ -1937,6 +2021,24 @@ app.get("/api/me/api-key/status", requireAuth, (req, res) => {
   res.json({ apiKey: publicUser(req.user.id).apiKey });
 });
 
+app.get("/api/me/tasks", requireAuth, (req, res) => {
+  const query = String(req.query.q || "").trim();
+  const status = String(req.query.status || "").trim();
+  const like = query ? `%${query}%` : "";
+  const limit = Math.min(Math.max(Number(req.query.limit || 120), 1), 500);
+  const tasks = statements.tasksForUserHistory.all(
+    req.user.id,
+    query,
+    like,
+    like,
+    like,
+    status,
+    status,
+    limit,
+  ).map(taskHistoryResponse);
+  res.json({ tasks });
+});
+
 function titleFromPrompt(text) {
   const title = String(text || "").trim().replace(/\s+/g, " ").slice(0, 22);
   return title || "新的对话制作";
@@ -2083,6 +2185,8 @@ app.get("/api/creation-sessions/:sessionId", requireAuth, (req, res) => {
     resultNodeId: task.result_node_id,
     sourceNodeId: task.source_node_id,
     upstreamTaskId: task.upstream_task_id,
+    source: task.source || "chat",
+    error: jsonParse(task.error_json, null),
     clipOrder: task.clip_order,
     createdAt: task.created_at,
   }));
@@ -2204,6 +2308,7 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
       });
       saveEdge(linkedProject.id, { id: id("edge"), source: sourceNodeId, target: resultNodeId, kind: "render", data: { kind: "render" } });
       statements.createTask.run(taskIdValue, linkedProject.id, req.user.id, sourceNodeId, resultNodeId, "queued", 0, jsonStringify(safeJson(payload)), jsonStringify({ localRequest: { requestId: req.requestId, body: safeJson(req.body) } }));
+      statements.updateTaskSource.run("chat", taskIdValue);
       const taskMessageId = id("msg");
       statements.createCreationMessage.run(taskMessageId, session.id, "assistant", "task_card", jsonStringify({ taskId: taskIdValue, status: "queued", plan }));
       statements.linkSessionTask.run(id("sessiontask"), session.id, taskIdValue, taskMessageId, clipOrder, null, 1);
@@ -2334,17 +2439,124 @@ app.post("/api/me/api-key/test", requireAuth, async (req, res) => {
     metadata: { ratio: "16:9", resolution: "720p", watermark: false },
   };
 
+  const project = ensureUtilityProject(req.user.id);
+  const sourceNodeId = id("shot");
+  const resultNodeId = id("render");
+  const taskIdValue = id("task");
+  const baseX = 80 + Math.floor(Math.random() * 80);
+  const shotData = defaultShotData({
+    title: "API key 测试",
+    prompt: payload.prompt,
+    duration: payload.duration,
+    ratio: "16:9",
+    resolution: "720p",
+    model: payload.model,
+  });
+  db.transaction(() => {
+    saveNode(project.id, { id: sourceNodeId, type: "shot", position: { x: baseX, y: 80 }, data: shotData });
+    saveNode(project.id, {
+      id: resultNodeId,
+      type: "render",
+      position: { x: baseX + 420, y: 80 },
+      data: {
+        title: "API key 测试结果",
+        status: "queued",
+        progress: 0,
+        taskId: taskIdValue,
+        sourceNodeId,
+        upstreamTaskId: "",
+        videoUrl: "",
+        resultUrl: "",
+        error: "",
+      },
+    });
+    saveEdge(project.id, { id: id("edge"), source: sourceNodeId, target: resultNodeId, kind: "render", data: { kind: "render" } });
+    statements.createTask.run(
+      taskIdValue,
+      project.id,
+      req.user.id,
+      sourceNodeId,
+      resultNodeId,
+      "queued",
+      0,
+      jsonStringify(safeJson(payload)),
+      jsonStringify({ localRequest: { method: "POST", url: "/api/me/api-key/test", body: safeJson(payload) } }),
+    );
+    statements.updateTaskSource.run("test", taskIdValue);
+  })();
+  recordRequestLog(req, {
+    action: "api_key_test_created",
+    projectId: project.id,
+    taskId: taskIdValue,
+    nodeId: resultNodeId,
+    sourceNodeId,
+    status: "queued",
+    message: "API key 测试任务已创建",
+  });
+
   try {
     const { body, debug } = await callProvider(req.user.id, "POST", "/v1/video/generations", payload);
-    res.json({ ok: true, ...normalizeTask(body), debug });
+    const normalized = normalizeTask(body);
+    statements.updateTaskSubmitted.run(
+      normalized.upstreamTaskId || "",
+      normalized.status,
+      normalized.progress ?? 0,
+      jsonStringify(safeJson(body)),
+      jsonStringify(debug),
+      taskIdValue,
+    );
+    updateRenderNode(project.id, resultNodeId, {
+      status: normalized.status,
+      progress: normalized.progress ?? 0,
+      upstreamTaskId: normalized.upstreamTaskId || "",
+      videoUrl: normalized.videoUrl || "",
+      resultUrl: normalized.resultUrl || "",
+    });
+    recordRequestLog(req, {
+      action: "api_key_test_submitted",
+      projectId: project.id,
+      taskId: taskIdValue,
+      nodeId: resultNodeId,
+      sourceNodeId,
+      providerTaskId: normalized.upstreamTaskId,
+      status: normalized.status,
+      message: "API key 测试上游任务已提交",
+    });
+    res.json({ ok: true, ...normalized, task: taskResponse(statements.taskById.get(taskIdValue)), projectId: project.id, resultNodeId, sourceNodeId, debug });
   } catch (error) {
+    statements.updateTaskError.run(
+      jsonStringify({ message: error.message, upstream: error.upstream }),
+      jsonStringify(error.debug || {}),
+      taskIdValue,
+    );
     const logged = createErrorEvent(req, error, {
       source: "provider",
       code: error.code || "PROVIDER_HTTP_ERROR",
+      projectId: project.id,
+      taskId: taskIdValue,
+      nodeId: resultNodeId,
       request: { body: payload },
       response: { message: error.message, upstream: error.upstream },
       debug: error.debug,
       statusCode: error.statusCode || 500,
+    });
+    updateRenderNode(project.id, resultNodeId, {
+      status: "failed",
+      error: error.message,
+      errorCode: logged.code,
+      requestId: logged.requestId,
+      eventId: logged.eventId,
+    });
+    recordRequestLog(req, {
+      action: "api_key_test_failed",
+      projectId: project.id,
+      taskId: taskIdValue,
+      nodeId: resultNodeId,
+      sourceNodeId,
+      status: "failed",
+      message: error.message,
+      hasError: true,
+      eventId: logged.eventId,
     });
     res.status(error.statusCode || 500).json({
       error: {
@@ -2352,6 +2564,7 @@ app.post("/api/me/api-key/test", requireAuth, async (req, res) => {
         code: logged.code,
         requestId: logged.requestId,
         eventId: logged.eventId,
+        taskId: taskIdValue,
         upstream: error.upstream,
         debug: error.debug || {
           localRequest: { method: "POST", url: "/api/me/api-key/test", body: safeJson(payload) },
@@ -2679,8 +2892,68 @@ app.post("/api/projects/:projectId/render-nodes/:nodeId/continue", requireAuth, 
   res.status(201).json({ node: nextShot, edge: { ...edge, type: "smoothstep", animated: true } });
 });
 
+app.get("/api/tasks", requireAuth, (req, res) => {
+  const filters = parseTaskListFilters(req);
+  const countQuery = taskListWhere(filters);
+  const countParams = { ...countQuery.params, userId: req.user.id };
+  delete countParams.limit;
+  delete countParams.offset;
+  const rows = listTasksForUser(req.user.id, filters);
+  const total = db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM generation_tasks
+    LEFT JOIN projects ON projects.id = generation_tasks.project_id
+    WHERE ${countQuery.where}
+  `).get(countParams)?.total || 0;
+  const projects = statements.projectsForUser.all(req.user.id).map((project) => ({
+    id: project.id,
+    name: project.name,
+  }));
+  res.json({ tasks: rows.map(taskCenterResponse), projects, total, limit: filters.limit, offset: filters.offset });
+});
+
+app.get("/api/tasks/export.csv", requireAuth, (req, res) => {
+  const filters = parseTaskListFilters(req);
+  filters.limit = 500;
+  filters.offset = 0;
+  const rows = listTasksForUser(req.user.id, filters);
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", `attachment; filename="tasks-${new Date().toISOString().slice(0, 10)}.csv"`);
+  res.send(tasksToCsv(rows));
+});
+
+app.post("/api/tasks/batch-refresh", requireAuth, async (req, res) => {
+  const ids = Array.isArray(req.body.taskIds) ? req.body.taskIds.map((value) => String(value || "").trim()).filter(Boolean) : [];
+  const mode = String(req.body.mode || "");
+  let tasks = [];
+  if (ids.length) {
+    tasks = ids
+      .map((taskId) => statements.taskLookupForUser.get(req.user.id, taskId, taskId))
+      .filter(Boolean);
+  } else if (mode === "recoverable") {
+    tasks = db.prepare(`
+      SELECT *
+      FROM generation_tasks
+      WHERE user_id = ?
+        AND status IN ('queued', 'submitted', 'in_progress', 'failed')
+        AND upstream_task_id IS NOT NULL
+        AND upstream_task_id != ''
+      ORDER BY updated_at DESC
+      LIMIT 80
+    `).all(req.user.id);
+  }
+
+  const results = [];
+  for (const task of tasks) {
+    const refreshed = await refreshTask(task, req.user.id, req, { force: true, action: "task_center_batch_refresh" });
+    results.push(taskResponse(refreshed));
+  }
+  res.json({ tasks: results, count: results.length });
+});
+
 app.get("/api/tasks/:taskId", requireAuth, async (req, res) => {
-  const task = statements.taskForUser.get(req.params.taskId, req.user.id);
+  const lookupId = String(req.params.taskId || "").trim();
+  const task = statements.taskLookupForUser.get(req.user.id, lookupId, lookupId);
   if (!task) {
     res.status(404).json({ error: { message: "任务不存在。" } });
     return;
@@ -2690,6 +2963,29 @@ app.get("/api/tasks/:taskId", requireAuth, async (req, res) => {
     action: req.query.force ? "task_force_refresh" : "task_refresh",
   });
   res.json({ task: taskResponse(refreshed) });
+});
+
+app.get("/api/task-query/:taskId", requireAuth, async (req, res) => {
+  const taskId = String(req.params.taskId || "").trim();
+  let task = statements.taskLookupForUser.get(req.user.id, taskId, taskId);
+  if (!task) {
+    res.status(404).json({ error: { message: "Task ID 不存在或不属于当前账号。", code: "TASK_NOT_FOUND", requestId: req.requestId } });
+    return;
+  }
+  task = await refreshTask(task, req.user.id, req, { force: true, action: "task_query_page" });
+  const logs = statements.requestLogsForUserTask.all(task.id, req.user.id).map(requestLogRowToSummary);
+  const events = statements.errorEventsForTask.all(task.id, req.user.id).map((row) => ({
+    eventId: row.id,
+    requestId: row.request_id,
+    taskId: row.task_id,
+    nodeId: row.node_id,
+    providerTaskId: row.provider_task_id,
+    code: row.code,
+    message: row.message,
+    severity: row.severity,
+    createdAt: row.created_at,
+  }));
+  res.json({ task: taskResponse(task), logs, events });
 });
 
 app.get("/api/tasks/:taskId/debug", requireAuth, (req, res) => {
