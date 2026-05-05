@@ -144,6 +144,11 @@ function safeJsonText(value) {
   }
 }
 
+function copyText(value) {
+  if (!value) return;
+  navigator.clipboard?.writeText(String(value));
+}
+
 function cx(...classes) {
   return classes.filter(Boolean).join(" ");
 }
@@ -232,10 +237,16 @@ function GlassNav({ user, onLogout }) {
         <a href="/#workflow">流程</a>
         <a href="/#security">安全</a>
         {user && <Link to="/logs">错误日志</Link>}
+        {user?.isAdmin && <Link to="/admin/requests">管理后台</Link>}
       </nav>
       <div className="nav-actions">
         {user ? (
           <>
+            {user.isAdmin && (
+              <Link className="ghost-link" to="/admin/requests">
+                管理后台
+              </Link>
+            )}
             <Link className="ghost-link" to="/app">
               专业画布
             </Link>
@@ -404,6 +415,10 @@ function AuthShell({ mode, reload }) {
         body: JSON.stringify({ email, password, confirmPassword }),
       });
       await reload();
+      if (result.user?.isAdmin && result.user?.passwordResetRequired) {
+        navigate("/admin/reset-password");
+        return;
+      }
       navigate(result.user?.apiKey?.configured ? nextPath || "/make" : `/onboarding${nextPath ? `?next=${encodeURIComponent(nextPath)}` : ""}`);
     } catch (err) {
       setError(err.message);
@@ -461,6 +476,7 @@ function Onboarding({ me, reload }) {
   const [apiKey, setApiKey] = useState("");
   const [projectName, setProjectName] = useState("我的第一条连续视频");
   const [status, setStatus] = useState("");
+  const [statusTone, setStatusTone] = useState("info");
   const [debug, setDebug] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -470,13 +486,16 @@ function Onboarding({ me, reload }) {
     event.preventDefault();
     setBusy(true);
     setStatus("");
+    setStatusTone("info");
     setDebug(null);
     try {
       await api("/api/me/api-key", { method: "PUT", body: JSON.stringify({ apiKey }) });
       await reload();
       setStatus("API key 已加密保存。");
+      setStatusTone("success");
     } catch (error) {
       setStatus(error.message);
+      setStatusTone("error");
     } finally {
       setBusy(false);
     }
@@ -485,13 +504,16 @@ function Onboarding({ me, reload }) {
   async function testKey() {
     setBusy(true);
     setStatus("正在提交测试请求...");
+    setStatusTone("info");
     setDebug(null);
     try {
       const result = await api("/api/me/api-key/test", { method: "POST" });
       setStatus(result.upstreamTaskId ? `测试任务已提交：${result.upstreamTaskId}` : "接口连通。");
+      setStatusTone("success");
       setDebug(result.debug || result);
     } catch (error) {
       setStatus(error.message);
+      setStatusTone("error");
       setDebug(error.body || { message: error.message });
     } finally {
       setBusy(false);
@@ -500,14 +522,19 @@ function Onboarding({ me, reload }) {
 
   async function createAndEnter() {
     setBusy(true);
+    setStatus("正在创建本地画布...");
+    setStatusTone("info");
+    setDebug(null);
     try {
       const result = await api("/api/projects", {
         method: "POST",
         body: JSON.stringify({ name: projectName }),
       });
-      navigate(nextPath || `/app/projects/${result.project.id}`);
+      const targetPath = nextPath && nextPath !== "/app" ? nextPath : `/app/projects/${result.project.id}`;
+      navigate(targetPath);
     } catch (error) {
       setStatus(error.message);
+      setStatusTone("error");
     } finally {
       setBusy(false);
     }
@@ -540,7 +567,7 @@ function Onboarding({ me, reload }) {
           <button className="secondary-button" type="button" disabled={!me.user.apiKey?.configured || busy} onClick={testKey}>
             测试接口
           </button>
-          <span>{me.user.apiKey?.configured ? `已配置 ${me.user.apiKey.preview}` : "尚未配置"}</span>
+          <span>{me.user.apiKey?.configured ? `已配置 ${me.user.apiKey.preview} · 测试会创建一个 Seedance 任务` : "尚未配置"}</span>
         </div>
         <label className="project-name-field">
           项目名称
@@ -550,7 +577,7 @@ function Onboarding({ me, reload }) {
           进入无限画布
           <ArrowRight size={18} />
         </button>
-        {status && <div className="setup-status">{status}</div>}
+        {status && <div className={cx("setup-status", statusTone)}>{status}</div>}
         {debug && <pre className="debug-pre">{JSON.stringify(debug, null, 2)}</pre>}
       </section>
     </main>
@@ -559,7 +586,15 @@ function Onboarding({ me, reload }) {
 
 function RequireReady({ me, children }) {
   if (!me.user) return <Navigate to={`/login?next=${encodeURIComponent(window.location.pathname)}`} replace />;
+  if (me.user.passwordResetRequired) return <Navigate to="/admin/reset-password" replace />;
   if (!me.user.apiKey?.configured) return <Navigate to={`/onboarding?next=${encodeURIComponent(window.location.pathname)}`} replace />;
+  return children;
+}
+
+function RequireAdmin({ me, children }) {
+  if (!me.user) return <Navigate to="/admin/login" replace />;
+  if (!me.user.isAdmin) return <Navigate to="/" replace />;
+  if (me.user.passwordResetRequired) return <Navigate to="/admin/reset-password" replace />;
   return children;
 }
 
@@ -599,6 +634,11 @@ function MakeHub({ me }) {
           <Link className="secondary-button" to="/logs">
             错误日志
           </Link>
+          {me.user.isAdmin && (
+            <Link className="secondary-button" to="/admin/requests">
+              管理后台
+            </Link>
+          )}
         </div>
       </header>
       <section className="make-hero">
@@ -797,6 +837,16 @@ function ChatPage({ me }) {
     setDebugModal(result);
   }
 
+  async function refreshChatTask(taskId) {
+    if (!taskId) return;
+    try {
+      const result = await api(`/api/tasks/${taskId}?force=1`);
+      setTasks((current) => current.map((item) => (item.id === taskId ? { ...item, ...result.task } : item)));
+    } catch (error) {
+      setDebugModal(error.body || { message: error.message });
+    }
+  }
+
   const userMessages = messages.filter((message) => message.role === "user" && message.type === "text");
   const lastPrompt = userMessages[userMessages.length - 1]?.content?.text || "";
   const errorMessages = messages.filter((message) => message.type === "error");
@@ -819,10 +869,10 @@ function ChatPage({ me }) {
   const pipelineStatus = busy ? "parsing" : tasks.some((task) => ["queued", "in_progress", "submitted"].includes(task.status)) ? "running" : tasks.some((task) => task.status === "completed") ? "completed" : plan ? "ready" : lastPrompt ? "planned" : "idle";
   const planActionable = plan && !["submitted", "locked", "running", "completed"].includes(plan.status) && !plan.submittedTaskId;
   const composerHasText = Boolean(text.trim());
-  const composerDisabled = busy || (!composerHasText && !planActionable);
-  const composerLabel = busy ? "处理中" : composerHasText ? "解析创意" : planActionable ? "开始生成" : "解析创意";
+  const composerDisabled = busy || !composerHasText;
+  const composerLabel = busy ? "处理中" : "解析创意";
   const composerPlaceholder = planActionable
-    ? "可以继续补充要求；不输入内容时，点击右侧按钮会直接按当前解析生成。"
+    ? "可以继续补充要求并重新解析；生成按钮已放在上方创意解析卡片里。"
     : "例如：做一个 5 秒香水广告，黑色背景，镜头慢慢推进，不要文字。";
 
   return (
@@ -881,7 +931,11 @@ function ChatPage({ me }) {
                 setInspectorTab("preview");
               }}
               onOpenLogs={openTaskLogs}
+              onRefreshTask={refreshChatTask}
               errors={errorMessages}
+              onGenerate={generate}
+              canGenerate={Boolean(planActionable)}
+              generating={busy && Boolean(planActionable)}
             />
           )}
         </div>
@@ -898,10 +952,9 @@ function ChatPage({ me }) {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 if (text.trim()) sendPlan();
-                else if (planActionable) generate();
               }
             }} placeholder={composerPlaceholder} />
-            <button className="hero-primary" type="button" disabled={composerDisabled} onClick={() => (composerHasText ? sendPlan() : generate())}>
+            <button className="hero-primary" type="button" disabled={composerDisabled} onClick={() => sendPlan()}>
               {composerLabel}
             </button>
           </div>
@@ -987,7 +1040,7 @@ function ChatWelcome({ setText }) {
   );
 }
 
-function GenerationPipeline({ prompt, plan, tasks, busy, onContinue, onSelectTask, onOpenLogs, errors }) {
+function GenerationPipeline({ prompt, plan, tasks, busy, onContinue, onSelectTask, onOpenLogs, onRefreshTask, errors, onGenerate, canGenerate, generating }) {
   return (
     <section className="generation-pipeline">
       <PipelineStep index={1} title="输入创意" status={prompt ? "done" : "active"}>
@@ -998,9 +1051,9 @@ function GenerationPipeline({ prompt, plan, tasks, busy, onContinue, onSelectTas
         )}
       </PipelineStep>
 
-      <PipelineStep index={2} title="AI 解析" status={busy ? "active" : plan ? "done" : "idle"}>
-        {busy && <ParsingCard />}
-        {!busy && plan && <PlanSummaryCard plan={plan} />}
+      <PipelineStep index={2} title="AI 解析" status={busy && !plan ? "active" : plan ? "done" : "idle"}>
+        {busy && !plan && <ParsingCard />}
+        {plan && <PlanSummaryCard plan={plan} onGenerate={onGenerate} canGenerate={canGenerate} generating={generating} />}
         {!busy && !plan && <p className="pipeline-hint">等待解析提示词。</p>}
       </PipelineStep>
 
@@ -1012,6 +1065,7 @@ function GenerationPipeline({ prompt, plan, tasks, busy, onContinue, onSelectTas
             task={task}
             index={index}
             onDebug={onOpenLogs}
+            onRefresh={onRefreshTask}
             onContinue={onContinue}
             onSelect={() => onSelectTask(task.id)}
           />
@@ -1071,7 +1125,7 @@ function ParsingCard() {
   );
 }
 
-function PlanSummaryCard({ plan }) {
+function PlanSummaryCard({ plan, onGenerate, canGenerate, generating }) {
   if (!plan) return null;
   const submitted = ["submitted", "locked", "running", "completed"].includes(plan.status) || Boolean(plan.submittedTaskId);
   return (
@@ -1089,13 +1143,21 @@ function PlanSummaryCard({ plan }) {
       </div>
       <div className="readonly-status">
         {submitted ? <Lock size={15} /> : <WandSparkles size={15} />}
-        {submitted ? "参数已提交给生成任务，当前模块切换为只读摘要。" : "解析结果已准备好；请在底部操作栏开始生成或继续补充要求。"}
+        {submitted ? "参数已提交给生成任务，当前模块切换为只读摘要。" : "解析结果已准备好，可以直接生成，也可以在底部继续补充要求重新解析。"}
       </div>
+      {!submitted && (
+        <div className="plan-actions">
+          <button className="hero-primary glow-action" type="button" disabled={!canGenerate || generating} onClick={onGenerate}>
+            {generating ? <Loader2 className="spin" size={16} /> : <WandSparkles size={16} />}
+            {generating ? "正在提交生成" : "按这个解析生成"}
+          </button>
+        </div>
+      )}
     </section>
   );
 }
 
-function TaskChatCard({ task, index, onDebug, onContinue, onSelect }) {
+function TaskChatCard({ task, index, onDebug, onRefresh, onContinue, onSelect }) {
   const done = task.status === "completed" && task.videoUrl;
   const failed = task.status === "failed";
   const running = ["queued", "in_progress", "submitted"].includes(task.status);
@@ -1128,8 +1190,18 @@ function TaskChatCard({ task, index, onDebug, onContinue, onSelect }) {
         </div>
       )}
       <div className="task-actions">
-        {done && <button className="secondary-button" type="button" onClick={onContinue}>续写下一段</button>}
-        <button className="secondary-button" type="button" onClick={() => onDebug(task.id)}>查看完整日志</button>
+        {done && <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onContinue(); }}>续写下一段</button>}
+        <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); copyText(task.id); }}>
+          <Copy size={15} />
+          复制 Task ID
+        </button>
+        {failed && (
+          <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onRefresh?.(task.id); }}>
+            <RotateCcw size={15} />
+            重新拉取
+          </button>
+        )}
+        <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onDebug(task.id); }}>查看完整日志</button>
       </div>
     </div>
   );
@@ -1243,6 +1315,10 @@ function ResultInspector({ tab, setTab, task, currentVideo, plan, tasks, taskQue
               <InspectorKV label="本地任务" value={task.id} />
               <InspectorKV label="上游任务" value={task.upstreamTaskId || "等待提交"} />
               <InspectorKV label="状态" value={taskStatusLabel(task.status)} />
+              <button className="secondary-button" type="button" onClick={() => copyText(task.id)}>
+                <Copy size={15} />
+                复制 Task ID
+              </button>
               <button className="secondary-button" type="button" onClick={() => onOpenLogs(task.id)}>
                 打开完整日志
               </button>
@@ -1353,6 +1429,359 @@ function LogsPage({ me }) {
   );
 }
 
+function AdminLogin({ reload }) {
+  const navigate = useNavigate();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api("/api/admin/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      });
+      await reload();
+      navigate(result.resetRequired ? "/admin/reset-password" : "/admin/requests");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="auth-page admin-auth-page">
+      <Link className="brand auth-brand" to="/">
+        <ProductLogo />
+        连续视频画布
+      </Link>
+      <form className="auth-card" onSubmit={submit}>
+        <p className="eyebrow">Admin</p>
+        <h1>管理员登录</h1>
+        <label>
+          管理员邮箱
+          <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" required />
+        </label>
+        <label>
+          密码
+          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} required />
+        </label>
+        {error && <div className="form-error">{error}</div>}
+        <button className="full-primary" type="submit" disabled={busy}>
+          {busy && <Loader2 size={16} className="spin" />}
+          进入管理后台
+        </button>
+        <p className="auth-switch">
+          普通账号
+          <Link to="/login">去工作台登录</Link>
+        </p>
+      </form>
+    </main>
+  );
+}
+
+function AdminPasswordReset({ me, reload }) {
+  const navigate = useNavigate();
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  if (!me.user) return <Navigate to="/admin/login" replace />;
+  if (!me.user.isAdmin) return <Navigate to="/" replace />;
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api("/api/admin/password", {
+        method: "POST",
+        body: JSON.stringify({ currentPassword, newPassword, confirmPassword }),
+      });
+      await reload();
+      navigate("/admin/requests");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="auth-page admin-auth-page">
+      <Link className="brand auth-brand" to="/">
+        <ProductLogo />
+        连续视频画布
+      </Link>
+      <form className="auth-card" onSubmit={submit}>
+        <p className="eyebrow">First Login</p>
+        <h1>重置管理员密码</h1>
+        <label>
+          当前密码
+          <input value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} type="password" required />
+        </label>
+        <label>
+          新密码
+          <input value={newPassword} onChange={(event) => setNewPassword(event.target.value)} type="password" minLength={10} required />
+        </label>
+        <label>
+          确认新密码
+          <input value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} type="password" minLength={10} required />
+        </label>
+        {error && <div className="form-error">{error}</div>}
+        <button className="full-primary" type="submit" disabled={busy}>
+          {busy && <Loader2 size={16} className="spin" />}
+          保存新密码
+        </button>
+      </form>
+    </main>
+  );
+}
+
+function AdminShell({ me, title, subtitle, children }) {
+  const navigate = useNavigate();
+  async function logout() {
+    await api("/api/auth/logout", { method: "POST" }).catch(() => null);
+    navigate("/admin/login");
+  }
+  return (
+    <main className="admin-page">
+      <header className="admin-header">
+        <div>
+          <p className="eyebrow">Admin Console</p>
+          <h1>{title}</h1>
+          <p>{subtitle}</p>
+        </div>
+        <div className="admin-actions">
+          <span className="status-pill success">{me.user.email}</span>
+          <Link className="secondary-button" to="/admin/requests">
+            请求日志
+          </Link>
+          <Link className="secondary-button" to="/admin/task-query">
+            Task 查询
+          </Link>
+          <button className="secondary-button" type="button" onClick={logout}>
+            <LogOut size={15} />
+            退出
+          </button>
+        </div>
+      </header>
+      {children}
+    </main>
+  );
+}
+
+function AdminRequestsPage({ me }) {
+  const [logs, setLogs] = useState([]);
+  const [filters, setFilters] = useState({ taskId: "", requestId: "", nodeId: "", hasError: "" });
+  const [loading, setLoading] = useState(true);
+  const [drawer, setDrawer] = useState(null);
+  const [queryingTaskId, setQueryingTaskId] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const params = new URLSearchParams(Object.entries(filters).filter(([, value]) => value !== ""));
+    const result = await api(`/api/admin/request-logs?${params.toString()}`);
+    setLogs(result.logs || []);
+    setLoading(false);
+  }, [filters]);
+
+  useEffect(() => {
+    load().catch((error) => setDrawer({ error: error.body || { message: error.message } }));
+  }, [load]);
+
+  async function queryTask(taskId) {
+    if (!taskId) return;
+    setQueryingTaskId(taskId);
+    try {
+      const result = await api(`/api/admin/tasks/${encodeURIComponent(taskId)}?refresh=1`);
+      setDrawer(result);
+    } catch (error) {
+      setDrawer({ error: error.body || { message: error.message } });
+    } finally {
+      setQueryingTaskId("");
+    }
+  }
+
+  return (
+    <AdminShell me={me} title="所有请求日志" subtitle="只展示 ID、状态和错误摘要；Task 查询结果在右侧抽屉打开。">
+      <section className="admin-filters">
+        <label>
+          Task ID
+          <input value={filters.taskId} onChange={(event) => setFilters({ ...filters, taskId: event.target.value })} placeholder="task_ 或上游 task id" />
+        </label>
+        <label>
+          Request ID
+          <input value={filters.requestId} onChange={(event) => setFilters({ ...filters, requestId: event.target.value })} placeholder="req_" />
+        </label>
+        <label>
+          Node ID
+          <input value={filters.nodeId} onChange={(event) => setFilters({ ...filters, nodeId: event.target.value })} placeholder="render_ / shot_" />
+        </label>
+        <label>
+          错误
+          <select value={filters.hasError} onChange={(event) => setFilters({ ...filters, hasError: event.target.value })}>
+            <option value="">全部</option>
+            <option value="1">只看错误</option>
+            <option value="0">只看正常</option>
+          </select>
+        </label>
+        <button className="secondary-button" type="button" onClick={load}>
+          <RotateCcw size={15} />
+          刷新
+        </button>
+      </section>
+      <section className="admin-table">
+        <div className="admin-row head">
+          <span>时间</span>
+          <span>用户</span>
+          <span>Action</span>
+          <span>Task ID</span>
+          <span>Provider Task</span>
+          <span>状态</span>
+          <span>Message</span>
+          <span>查询</span>
+        </div>
+        {loading && <p className="muted admin-empty">加载中...</p>}
+        {!loading && !logs.length && <p className="muted admin-empty">暂无请求日志。</p>}
+        {logs.map((log) => (
+          <div className={cx("admin-row", log.hasError && "error")} key={log.id}>
+            <span>{log.createdAt}</span>
+            <span>{log.userEmail || log.userId || "unknown"}</span>
+            <span>{log.action}</span>
+            <button className="text-copy" type="button" onClick={() => copyText(log.taskId)}>
+              {log.taskId || "-"}
+            </button>
+            <button className="text-copy" type="button" onClick={() => copyText(log.providerTaskId)}>
+              {log.providerTaskId || "-"}
+            </button>
+            <span>{taskStatusLabel(log.taskStatus || log.status)}</span>
+            <span>{log.message || (log.hasError ? "error" : "ok")}</span>
+            <button className="secondary-button compact" type="button" disabled={!log.taskId || queryingTaskId === log.taskId} onClick={() => queryTask(log.taskId)}>
+              {queryingTaskId === log.taskId ? <Loader2 className="spin" size={14} /> : <Search size={14} />}
+              结果
+            </button>
+          </div>
+        ))}
+      </section>
+      {drawer && <TaskResultDrawer detail={drawer} onClose={() => setDrawer(null)} onRefresh={(taskId) => queryTask(taskId)} />}
+    </AdminShell>
+  );
+}
+
+function AdminTaskQueryPage({ me }) {
+  const [taskId, setTaskId] = useState("");
+  const [drawer, setDrawer] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function query(event) {
+    if (event?.preventDefault) event.preventDefault();
+    if (!taskId.trim()) return;
+    setBusy(true);
+    try {
+      const result = await api(`/api/admin/tasks/${encodeURIComponent(taskId.trim())}?refresh=1`);
+      setDrawer(result);
+    } catch (error) {
+      setDrawer({ error: error.body || { message: error.message } });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <AdminShell me={me} title="Task ID 结果查询" subtitle="输入本地 Task ID 或上游 Task ID，后台会调用接口刷新一次生成结果。">
+      <form className="admin-query-card" onSubmit={query}>
+        <label>
+          Task ID
+          <input value={taskId} onChange={(event) => setTaskId(event.target.value)} placeholder="task_..." />
+        </label>
+        <button className="hero-primary" type="submit" disabled={busy || !taskId.trim()}>
+          {busy ? <Loader2 className="spin" size={16} /> : <Search size={16} />}
+          查询生成结果
+        </button>
+      </form>
+      {drawer && <TaskResultDrawer detail={drawer} onClose={() => setDrawer(null)} onRefresh={() => query()} />}
+    </AdminShell>
+  );
+}
+
+function TaskResultDrawer({ detail, onClose, onRefresh }) {
+  const task = detail?.task;
+  return (
+    <div className="drawer-backdrop" onClick={onClose}>
+      <aside className="task-result-drawer" onClick={(event) => event.stopPropagation()}>
+        <div className="drawer-header">
+          <div>
+            <strong>{task ? taskStatusLabel(task.status) : "查询结果"}</strong>
+            <span>{task?.id || detail?.error?.error?.requestId || "无 Task"}</span>
+          </div>
+          <button className="tool-button" type="button" onClick={onClose}>
+            <Check size={17} />
+          </button>
+        </div>
+        {detail?.error ? (
+          <div className="drawer-error">{detail.error?.error?.message || detail.error?.message || "查询失败"}</div>
+        ) : (
+          <>
+            {task?.videoUrl && <video className="drawer-video" src={task.videoUrl} controls playsInline />}
+            <div className="drawer-grid">
+              <InspectorKV label="Task ID" value={task?.id} />
+              <InspectorKV label="上游 Task" value={task?.upstreamTaskId || "无"} />
+              <InspectorKV label="用户" value={task?.userEmail || task?.userId} />
+              <InspectorKV label="项目" value={task?.projectId} />
+              <InspectorKV label="结果节点" value={task?.resultNodeId} />
+              <InspectorKV label="进度" value={`${task?.progress ?? 0}%`} />
+            </div>
+            <div className="drawer-actions">
+              <button className="secondary-button" type="button" onClick={() => copyText(task?.id)}>
+                <Copy size={15} />
+                复制 Task ID
+              </button>
+              <button className="secondary-button" type="button" onClick={() => copyText(task?.videoUrl || task?.resultUrl || "")} disabled={!task?.videoUrl && !task?.resultUrl}>
+                <Copy size={15} />
+                复制结果 URL
+              </button>
+              <button className="secondary-button" type="button" onClick={() => onRefresh?.(task?.id)} disabled={!task?.id}>
+                <RotateCcw size={15} />
+                重新查询
+              </button>
+            </div>
+            <section className="drawer-section">
+              <h3>请求日志</h3>
+              {(detail.logs || []).map((log) => (
+                <div className="drawer-log-row" key={log.id}>
+                  <span>{log.createdAt}</span>
+                  <strong>{log.action}</strong>
+                  <small>{log.message || log.status}</small>
+                </div>
+              ))}
+              {!detail.logs?.length && <p className="muted">暂无轻量请求日志。</p>}
+            </section>
+            <section className="drawer-section">
+              <h3>错误事件</h3>
+              {(detail.events || []).map((event) => (
+                <div className="drawer-log-row error" key={event.eventId}>
+                  <span>{event.createdAt}</span>
+                  <strong>{event.code}</strong>
+                  <small>{event.message}</small>
+                </div>
+              ))}
+              {!detail.events?.length && <p className="muted">暂无错误事件。</p>}
+            </section>
+          </>
+        )}
+      </aside>
+    </div>
+  );
+}
+
 function ErrorLogModal({ event, onClose }) {
   const [tab, setTab] = useState("overview");
   const [search, setSearch] = useState("");
@@ -1430,6 +1859,7 @@ function StudioGate({ me }) {
   }, [me.user, navigate, params.projectId]);
 
   if (!me.user) return <Navigate to="/login" replace />;
+  if (me.user.passwordResetRequired) return <Navigate to="/admin/reset-password" replace />;
   if (!me.user.apiKey?.configured) return <Navigate to="/onboarding" replace />;
   if (loading || !params.projectId) return <LoadingScreen />;
   return <Studio me={me} projects={projects} projectId={params.projectId} />;
@@ -1447,6 +1877,7 @@ function LoadingScreen() {
 function ShotNode({ id, data, selected }) {
   const actions = data.actions || {};
   const patch = (field, value) => actions.patchNode?.(id, { [field]: value });
+  const submitting = data.status === "submitting";
   return (
     <article className={cx("canvas-node shot-node", selected && "selected")}>
       <Handle type="target" position={Position.Left} />
@@ -1492,9 +1923,9 @@ function ShotNode({ id, data, selected }) {
         />
       </label>
       <div className="node-actions">
-        <button className="node-primary nodrag" type="button" onClick={() => actions.generate?.(id)}>
-          <WandSparkles size={15} />
-          生成
+        <button className="node-primary nodrag" type="button" disabled={submitting} onClick={() => actions.generate?.(id)}>
+          {submitting ? <Loader2 className="spin" size={15} /> : <WandSparkles size={15} />}
+          {submitting ? "提交中" : "生成"}
         </button>
         <button className="node-ghost nodrag" type="button" onClick={() => actions.duplicate?.(id)}>
           <Copy size={15} />
@@ -1549,6 +1980,17 @@ function RenderNode({ id, data, selected }) {
             续写下一段
           </button>
         )}
+        {data.taskId && (
+          <button className="node-ghost nodrag" type="button" onClick={() => copyText(data.taskId)}>
+            <Copy size={15} />
+          </button>
+        )}
+        {failed && data.taskId && (
+          <button className="node-ghost nodrag" type="button" onClick={() => actions.refreshTask?.(data.taskId)}>
+            <RotateCcw size={15} />
+            重新拉取
+          </button>
+        )}
         <button className="node-ghost nodrag" type="button" onClick={() => actions.showDebug?.(data.taskId, data.eventId)}>
           完整日志
         </button>
@@ -1592,6 +2034,117 @@ const nodeTypes = {
   asset: AssetNode,
 };
 
+const renderRuntimeFields = new Set([
+  "status",
+  "progress",
+  "taskId",
+  "sourceNodeId",
+  "upstreamTaskId",
+  "videoUrl",
+  "resultUrl",
+  "lastFrameAssetId",
+  "error",
+  "errorCode",
+  "requestId",
+  "eventId",
+]);
+
+function positionSort(a, b) {
+  return (a.position?.x ?? 0) - (b.position?.x ?? 0) || (a.position?.y ?? 0) - (b.position?.y ?? 0);
+}
+
+function orderSequenceClips(nodes, edges) {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const outgoing = new Map();
+  const incoming = new Set();
+  for (const edge of edges) {
+    if (!edge?.source || !edge?.target) continue;
+    incoming.add(edge.target);
+    if (!outgoing.has(edge.source)) outgoing.set(edge.source, []);
+    outgoing.get(edge.source).push(edge);
+  }
+  for (const edgeList of outgoing.values()) {
+    edgeList.sort((a, b) => {
+      const aNode = nodeById.get(a.target);
+      const bNode = nodeById.get(b.target);
+      return positionSort(aNode || {}, bNode || {});
+    });
+  }
+
+  const clips = [];
+  const visited = new Set();
+  const isCompletedClip = (node) => node?.type === "render" && node.data?.status === "completed" && node.data?.videoUrl;
+
+  function visit(nodeId) {
+    if (!nodeId || visited.has(nodeId)) return;
+    visited.add(nodeId);
+    const node = nodeById.get(nodeId);
+    if (!node) return;
+    if (isCompletedClip(node)) clips.push(node);
+    for (const edge of outgoing.get(nodeId) || []) {
+      visit(edge.target);
+    }
+  }
+
+  nodes
+    .filter((node) => !incoming.has(node.id))
+    .slice()
+    .sort(positionSort)
+    .forEach((node) => visit(node.id));
+
+  nodes
+    .slice()
+    .sort(positionSort)
+    .forEach((node) => visit(node.id));
+
+  return clips;
+}
+
+function cleanDuplicatedNodeData(node) {
+  const data = { ...(node.data || {}) };
+  delete data.actions;
+  if (node.type === "render") {
+    for (const field of renderRuntimeFields) delete data[field];
+    return {
+      ...data,
+      title: `${node.data?.title || "视频结果"} 副本`,
+      status: "draft",
+      progress: 0,
+      videoUrl: "",
+      resultUrl: "",
+      error: "",
+    };
+  }
+  if (node.type === "shot") {
+    return {
+      ...data,
+      title: `${node.data?.title || "镜头"} 副本`,
+      status: "draft",
+    };
+  }
+  return {
+    ...data,
+    title: `${node.data?.title || "节点"} 副本`,
+  };
+}
+
+function createsConnectionCycle(edges, connection) {
+  const nextEdges = [...edges, connection];
+  const outgoing = new Map();
+  for (const edge of nextEdges) {
+    if (!outgoing.has(edge.source)) outgoing.set(edge.source, []);
+    outgoing.get(edge.source).push(edge.target);
+  }
+  const seen = new Set();
+  function visit(nodeId) {
+    if (nodeId === connection.source) return true;
+    if (seen.has(nodeId)) return false;
+    seen.add(nodeId);
+    return (outgoing.get(nodeId) || []).some(visit);
+  }
+  return visit(connection.target);
+}
+
 function Studio({ me, projects, projectId }) {
   const navigate = useNavigate();
   const reactFlow = useReactFlow();
@@ -1607,6 +2160,9 @@ function Studio({ me, projects, projectId }) {
   const [sequenceClip, setSequenceClip] = useState(0);
   const loadedRef = useRef(false);
   const saveTimerRef = useRef(null);
+  const skipNextAutosaveRef = useRef(false);
+  const submittingNodeIdsRef = useRef(new Set());
+  const pollingTasksRef = useRef(false);
 
   const actionHandlers = useMemo(
     () => ({
@@ -1619,6 +2175,7 @@ function Studio({ me, projects, projectId }) {
       continueFrom: async (nodeId) => continueFromRender(nodeId),
       duplicate: (nodeId) => duplicateNode(nodeId),
       showDebug: async (taskId, eventId) => showDebug(taskId, eventId),
+      refreshTask: async (taskId) => refreshTaskResult(taskId),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [nodes, edges, projectId],
@@ -1636,12 +2193,8 @@ function Studio({ me, projects, projectId }) {
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
   const runningCount = nodes.filter((node) => node.type === "render" && ["queued", "in_progress"].includes(node.data?.status)).length;
   const completedClips = useMemo(
-    () =>
-      nodes
-        .filter((node) => node.type === "render" && node.data?.status === "completed" && node.data?.videoUrl)
-        .slice()
-        .sort((a, b) => a.position.x - b.position.x),
-    [nodes],
+    () => orderSequenceClips(nodes, edges),
+    [nodes, edges],
   );
 
   useEffect(() => {
@@ -1661,6 +2214,11 @@ function Studio({ me, projects, projectId }) {
 
   useEffect(() => {
     if (!loadedRef.current) return;
+    if (skipNextAutosaveRef.current) {
+      skipNextAutosaveRef.current = false;
+      setSaveState("已保存");
+      return;
+    }
     setSaveState("保存中...");
     clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(async () => {
@@ -1682,33 +2240,46 @@ function Studio({ me, projects, projectId }) {
   }, [nodes, edges, viewport, projectId]);
 
   useEffect(() => {
+    if (sequenceClip > 0 && sequenceClip >= completedClips.length) {
+      setSequenceClip(Math.max(completedClips.length - 1, 0));
+    }
+  }, [completedClips.length, sequenceClip]);
+
+  useEffect(() => {
     const timer = setInterval(async () => {
+      if (pollingTasksRef.current) return;
       const running = nodes.filter((node) => node.type === "render" && ["queued", "in_progress", "submitted"].includes(node.data?.status));
-      for (const node of running) {
-        if (!node.data?.taskId) continue;
-        try {
-          const result = await api(`/api/tasks/${node.data.taskId}`);
-          setNodes((current) =>
-            current.map((item) =>
-              item.id === result.task.resultNodeId
-                ? {
-                    ...item,
-                    data: {
-                      ...item.data,
-                      status: result.task.status,
-                      progress: result.task.progress,
-                      videoUrl: result.task.videoUrl || item.data.videoUrl,
-                      resultUrl: result.task.resultUrl || item.data.resultUrl,
-                      lastFrameAssetId: result.task.lastFrameAssetId,
-                      error: result.task.error?.message || "",
-                    },
-                  }
-                : item,
-            ),
-          );
-        } catch {
-          // Keep polling resilient; the debug button still exposes the stored task state.
-        }
+      const taskNodes = running.filter((node) => node.data?.taskId);
+      if (!taskNodes.length) return;
+      pollingTasksRef.current = true;
+      try {
+        const results = await Promise.allSettled(taskNodes.map((node) => api(`/api/tasks/${node.data.taskId}`)));
+        const taskUpdates = results
+          .filter((result) => result.status === "fulfilled" && result.value?.task?.resultNodeId)
+          .map((result) => result.value.task);
+        if (!taskUpdates.length) return;
+        skipNextAutosaveRef.current = true;
+        setNodes((current) => {
+          const updatesByNodeId = new Map(taskUpdates.map((task) => [task.resultNodeId, task]));
+          return current.map((item) => {
+            const task = updatesByNodeId.get(item.id);
+            if (!task) return item;
+            return {
+              ...item,
+              data: {
+                ...item.data,
+                status: task.status,
+                progress: task.progress,
+                videoUrl: task.videoUrl || item.data.videoUrl,
+                resultUrl: task.resultUrl || item.data.resultUrl,
+                lastFrameAssetId: task.lastFrameAssetId,
+                error: task.error?.message || "",
+              },
+            };
+          });
+        });
+      } finally {
+        pollingTasksRef.current = false;
       }
     }, 3000);
     return () => clearInterval(timer);
@@ -1748,11 +2319,30 @@ function Studio({ me, projects, projectId }) {
     setEdges((current) => applyEdgeChanges(changes, current));
   }, []);
 
-  const onConnect = useCallback((connection) => {
-    setEdges((current) =>
-      addEdge({ ...connection, id: uid("edge"), type: "smoothstep", animated: true, data: { kind: "custom" } }, current),
-    );
-  }, []);
+  const isValidConnection = useCallback(
+    (connection) => {
+      if (!connection.source || !connection.target || connection.source === connection.target) return false;
+      const sourceNode = nodes.find((node) => node.id === connection.source);
+      const targetNode = nodes.find((node) => node.id === connection.target);
+      if (!sourceNode || !targetNode) return false;
+      const semanticPair =
+        (sourceNode.type === "shot" && targetNode.type === "render") ||
+        (sourceNode.type === "render" && targetNode.type === "shot") ||
+        (sourceNode.type === "asset" && targetNode.type === "shot");
+      return semanticPair && !createsConnectionCycle(edges, connection);
+    },
+    [nodes, edges],
+  );
+
+  const onConnect = useCallback(
+    (connection) => {
+      if (!isValidConnection(connection)) return;
+      setEdges((current) =>
+        addEdge({ ...connection, id: uid("edge"), type: "smoothstep", animated: true, data: { kind: "custom" } }, current),
+      );
+    },
+    [isValidConnection],
+  );
 
   function addShotAt(position, overrides = {}) {
     const node = {
@@ -1793,11 +2383,14 @@ function Studio({ me, projects, projectId }) {
   function duplicateNode(nodeId) {
     const source = nodes.find((node) => node.id === nodeId);
     if (!source) return;
+    const sourceForCopy = source.type === "render"
+      ? nodes.find((node) => node.id === source.data?.sourceNodeId) || source
+      : source;
     const copy = {
-      ...cleanNode(source),
-      id: uid(source.type),
+      ...cleanNode(sourceForCopy),
+      id: uid(sourceForCopy.type),
       position: { x: source.position.x + 36, y: source.position.y + 36 },
-      data: { ...(source.data || {}), title: `${source.data?.title || "节点"} 副本` },
+      data: cleanDuplicatedNodeData(sourceForCopy),
     };
     setNodes((current) => [...current, copy]);
     setSelectedNodeId(copy.id);
@@ -1812,6 +2405,8 @@ function Studio({ me, projects, projectId }) {
   async function generateFromNode(nodeId) {
     const node = nodes.find((item) => item.id === nodeId);
     if (!node) return;
+    if (node.data?.status === "submitting" || submittingNodeIdsRef.current.has(nodeId)) return;
+    submittingNodeIdsRef.current.add(nodeId);
     setNodes((current) =>
       current.map((item) => (item.id === nodeId ? { ...item, data: { ...item.data, status: "submitting" } } : item)),
     );
@@ -1828,14 +2423,16 @@ function Studio({ me, projects, projectId }) {
       setSelectedNodeId(result.node.id);
     } catch (error) {
       const detail = error.body?.error || { message: error.message };
-      if (detail.node && detail.edge) {
-        setNodes((current) => [
-          ...current.map((item) => (item.id === nodeId ? { ...item, data: { ...item.data, status: "draft" } } : item)),
-          detail.node,
-        ]);
-        setEdges((current) => [...current, detail.edge]);
+      setNodes((current) => {
+        const reset = current.map((item) => (item.id === nodeId ? { ...item, data: { ...item.data, status: "draft" } } : item));
+        return detail.node && !reset.some((item) => item.id === detail.node.id) ? [...reset, detail.node] : reset;
+      });
+      if (detail.edge) {
+        setEdges((current) => (current.some((edge) => edge.id === detail.edge.id) ? current : [...current, detail.edge]));
       }
       setDebugModal(detail);
+    } finally {
+      submittingNodeIdsRef.current.delete(nodeId);
     }
   }
 
@@ -1848,6 +2445,40 @@ function Studio({ me, projects, projectId }) {
       setEdges((current) => [...current, result.edge]);
       setSelectedNodeId(result.node.id);
       setTimeout(() => reactFlow.fitView({ nodes: [{ id: result.node.id }], padding: 0.4, duration: 500 }), 80);
+    } catch (error) {
+      setDebugModal(error.body || { message: error.message });
+    }
+  }
+
+  async function refreshTaskResult(taskId) {
+    if (!taskId) return;
+    try {
+      const result = await api(`/api/tasks/${taskId}?force=1`);
+      const task = result.task;
+      const matched = nodes.some((item) => item.data?.taskId === task.id || item.id === task.resultNodeId);
+      setNodes((current) =>
+        current.map((item) => {
+          if (item.data?.taskId !== task.id && item.id !== task.resultNodeId) return item;
+          return {
+            ...item,
+            data: {
+              ...item.data,
+              status: task.status,
+              progress: task.progress,
+              upstreamTaskId: task.upstreamTaskId || item.data.upstreamTaskId,
+              videoUrl: task.videoUrl || item.data.videoUrl,
+              resultUrl: task.resultUrl || item.data.resultUrl,
+              lastFrameAssetId: task.lastFrameAssetId,
+              error: task.error?.message || "",
+            },
+          };
+        }),
+      );
+      if (!matched) {
+        const canvas = await api(`/api/projects/${projectId}/canvas`);
+        setNodes(canvas.nodes || []);
+        setEdges(canvas.edges || []);
+      }
     } catch (error) {
       setDebugModal(error.body || { message: error.message });
     }
@@ -1961,6 +2592,7 @@ function Studio({ me, projects, projectId }) {
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          isValidConnection={isValidConnection}
           onPaneContextMenu={onPaneContextMenu}
           onNodeContextMenu={onNodeContextMenu}
           onNodeClick={(_, node) => setSelectedNodeId(node.id)}
@@ -1977,7 +2609,7 @@ function Studio({ me, projects, projectId }) {
         </ReactFlow>
       </section>
 
-      <PropertyPanel node={selectedNode} onPatch={actionHandlers.patchNode} onGenerate={generateFromNode} onContinue={continueFromRender} />
+      <PropertyPanel node={selectedNode} onPatch={actionHandlers.patchNode} onGenerate={generateFromNode} onContinue={continueFromRender} onRefreshTask={refreshTaskResult} />
       <SequenceBar clips={completedClips} activeIndex={sequenceClip} setActiveIndex={setSequenceClip} />
 
       {contextMenu && (
@@ -2002,7 +2634,7 @@ function Studio({ me, projects, projectId }) {
   );
 }
 
-function PropertyPanel({ node, onPatch, onGenerate, onContinue }) {
+function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask }) {
   if (!node) {
     return (
       <aside className="property-panel empty">
@@ -2014,6 +2646,7 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue }) {
   }
   const data = node.data || {};
   const patch = (field, value) => onPatch(node.id, { [field]: value });
+  const submitting = data.status === "submitting";
   return (
     <aside className="property-panel">
       <div className="panel-heading">
@@ -2102,9 +2735,9 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue }) {
               生成音频
             </label>
           </div>
-          <button className="full-primary" type="button" onClick={() => onGenerate(node.id)}>
-            <WandSparkles size={16} />
-            生成这个镜头
+          <button className="full-primary" type="button" disabled={submitting} onClick={() => onGenerate(node.id)}>
+            {submitting ? <Loader2 className="spin" size={16} /> : <WandSparkles size={16} />}
+            {submitting ? "正在提交" : "生成这个镜头"}
           </button>
         </>
       )}
@@ -2115,6 +2748,21 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue }) {
             <strong>{data.status}</strong>
             <span>{data.progress ?? 0}%</span>
           </div>
+          {data.taskId && (
+            <div className="task-trace-panel compact-panel">
+              <InspectorKV label="Task ID" value={data.taskId} />
+              <button className="secondary-button" type="button" onClick={() => copyText(data.taskId)}>
+                <Copy size={15} />
+                复制 Task ID
+              </button>
+              {data.status === "failed" && (
+                <button className="secondary-button" type="button" onClick={() => onRefreshTask?.(data.taskId)}>
+                  <RotateCcw size={15} />
+                  重新拉取结果
+                </button>
+              )}
+            </div>
+          )}
           {data.videoUrl && (
             <>
               <video className="panel-video" src={data.videoUrl} muted autoPlay loop controls playsInline />
@@ -2176,7 +2824,7 @@ function ContextMenu({ menu, node, onAddShot, onAddNote, onAddAsset, onDuplicate
           )}
           <button type="button" onClick={onDuplicate}>
             <Copy size={15} />
-            复制
+            {node.type === "render" ? "复制源镜头" : "复制"}
           </button>
           <button type="button" className="danger" onClick={onDelete}>
             <Trash2 size={15} />
@@ -2292,6 +2940,10 @@ function AppRoutes() {
       <Route path="/" element={<HomePage me={me} reload={me.reload} />} />
       <Route path="/login" element={<AuthShell mode="login" reload={me.reload} />} />
       <Route path="/register" element={<AuthShell mode="register" reload={me.reload} />} />
+      <Route path="/admin/login" element={<AdminLogin reload={me.reload} />} />
+      <Route path="/admin/reset-password" element={<AdminPasswordReset me={me} reload={me.reload} />} />
+      <Route path="/admin/requests" element={<RequireAdmin me={me}><AdminRequestsPage me={me} /></RequireAdmin>} />
+      <Route path="/admin/task-query" element={<RequireAdmin me={me}><AdminTaskQueryPage me={me} /></RequireAdmin>} />
       <Route path="/onboarding" element={<Onboarding me={me} reload={me.reload} />} />
       <Route path="/make" element={<RequireReady me={me}><MakeHub me={me} /></RequireReady>} />
       <Route path="/make/chat" element={<RequireReady me={me}><ChatPage me={me} /></RequireReady>} />

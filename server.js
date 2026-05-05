@@ -47,12 +47,21 @@ app.use((req, res, next) => {
   next();
 });
 
+function ensureColumn(tableName, columnName, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (!columns.some((column) => column.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+}
+
 function migrate() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
+      is_admin INTEGER NOT NULL DEFAULT 0,
+      must_reset_password INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -232,21 +241,49 @@ function migrate() {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS request_logs (
+      id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      user_id INTEGER,
+      session_id TEXT,
+      project_id TEXT,
+      task_id TEXT,
+      node_id TEXT,
+      source_node_id TEXT,
+      provider_task_id TEXT,
+      event_id TEXT,
+      route TEXT,
+      method TEXT,
+      action TEXT NOT NULL,
+      status TEXT,
+      message TEXT,
+      has_error INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE INDEX IF NOT EXISTS idx_error_events_user_created ON error_events(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_error_events_task ON error_events(task_id);
     CREATE INDEX IF NOT EXISTS idx_error_events_request ON error_events(request_id);
+    CREATE INDEX IF NOT EXISTS idx_request_logs_created ON request_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_request_logs_task ON request_logs(task_id);
+    CREATE INDEX IF NOT EXISTS idx_request_logs_request ON request_logs(request_id);
   `);
+  ensureColumn("users", "is_admin", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("users", "must_reset_password", "INTEGER NOT NULL DEFAULT 0");
 }
 
 migrate();
 
 const statements = {
   userByEmail: db.prepare("SELECT * FROM users WHERE lower(email) = lower(?)"),
-  userById: db.prepare("SELECT id, email, created_at FROM users WHERE id = ?"),
+  userById: db.prepare("SELECT id, email, is_admin, must_reset_password, created_at FROM users WHERE id = ?"),
   createUser: db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)"),
+  createAdminUser: db.prepare("INSERT INTO users (email, password_hash, is_admin, must_reset_password) VALUES (?, ?, 1, 1)"),
+  promoteAdminUser: db.prepare("UPDATE users SET is_admin = 1 WHERE id = ?"),
+  updateUserPassword: db.prepare("UPDATE users SET password_hash = ?, must_reset_password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"),
   createSession: db.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)"),
   sessionById: db.prepare(`
-    SELECT sessions.*, users.email
+    SELECT sessions.*, users.email, users.is_admin, users.must_reset_password
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.id = ? AND sessions.expires_at > CURRENT_TIMESTAMP
@@ -270,6 +307,8 @@ const statements = {
   nodesForProject: db.prepare("SELECT * FROM canvas_nodes WHERE project_id = ?"),
   edgesForProject: db.prepare("SELECT * FROM canvas_edges WHERE project_id = ?"),
   nodeById: db.prepare("SELECT * FROM canvas_nodes WHERE id = ? AND project_id = ?"),
+  edgeById: db.prepare("SELECT * FROM canvas_edges WHERE id = ? AND project_id = ?"),
+  edgeForPair: db.prepare("SELECT * FROM canvas_edges WHERE project_id = ? AND source_node_id = ? AND target_node_id = ? LIMIT 1"),
   upsertNode: db.prepare(`
     INSERT INTO canvas_nodes (id, project_id, type, x, y, width, height, data_json, updated_at)
     VALUES (@id, @projectId, @type, @x, @y, @width, @height, @dataJson, CURRENT_TIMESTAMP)
@@ -389,6 +428,31 @@ const statements = {
       @providerRawText, @contextJson, @breadcrumbsJson, @userAgent, @ipHash, @fullLogPath
     )
   `),
+  insertRequestLog: db.prepare(`
+    INSERT INTO request_logs (
+      id, request_id, user_id, session_id, project_id, task_id, node_id, source_node_id,
+      provider_task_id, event_id, route, method, action, status, message, has_error
+    )
+    VALUES (
+      @id, @requestId, @userId, @sessionId, @projectId, @taskId, @nodeId, @sourceNodeId,
+      @providerTaskId, @eventId, @route, @method, @action, @status, @message, @hasError
+    )
+  `),
+  adminRequestLogs: db.prepare(`
+    SELECT request_logs.*, users.email AS user_email, generation_tasks.status AS task_status,
+      generation_tasks.video_url, generation_tasks.result_url, generation_tasks.upstream_task_id
+    FROM request_logs
+    LEFT JOIN users ON users.id = request_logs.user_id
+    LEFT JOIN generation_tasks ON generation_tasks.id = request_logs.task_id
+    WHERE (? = '' OR request_logs.task_id = ? OR request_logs.provider_task_id = ?)
+      AND (? = '' OR request_logs.request_id = ?)
+      AND (? = '' OR request_logs.event_id = ?)
+      AND (? = '' OR request_logs.node_id = ? OR request_logs.source_node_id = ?)
+      AND (? = '' OR CAST(request_logs.user_id AS TEXT) = ?)
+      AND (? = '' OR request_logs.has_error = ?)
+    ORDER BY request_logs.created_at DESC
+    LIMIT ?
+  `),
   errorEventsForUser: db.prepare(`
     SELECT id, request_id, user_id, session_id, project_id, task_id, node_id, source, severity, code,
       message, route, method, status_code, duration_ms, provider_status, provider_task_id,
@@ -408,6 +472,15 @@ const statements = {
   errorEventForUser: db.prepare("SELECT * FROM error_events WHERE id = ? AND user_id = ?"),
   patchErrorEvent: db.prepare("UPDATE error_events SET resolved_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id = ? AND user_id = ?"),
   errorEventsForTask: db.prepare("SELECT * FROM error_events WHERE task_id = ? AND user_id = ? ORDER BY created_at DESC"),
+  adminErrorEventsForTask: db.prepare("SELECT * FROM error_events WHERE task_id = ? ORDER BY created_at DESC"),
+  adminRequestLogsForTask: db.prepare("SELECT * FROM request_logs WHERE task_id = ? ORDER BY created_at DESC LIMIT 50"),
+  adminTaskById: db.prepare(`
+    SELECT generation_tasks.*, users.email AS user_email
+    FROM generation_tasks
+    JOIN users ON users.id = generation_tasks.user_id
+    WHERE generation_tasks.id = ? OR generation_tasks.upstream_task_id = ?
+    LIMIT 1
+  `),
   recentErrorsForUser: db.prepare(`
     SELECT id, request_id, source, severity, code, message, route, task_id, created_at
     FROM error_events
@@ -523,6 +596,32 @@ function fullErrorPayload(event) {
   });
 }
 
+function recordRequestLog(req, options = {}) {
+  try {
+    const task = options.taskId ? statements.taskById.get(options.taskId) : null;
+    statements.insertRequestLog.run({
+      id: options.id || id("rlog"),
+      requestId: options.requestId || req?.requestId || id("req"),
+      userId: options.userId ?? req?.user?.id ?? task?.user_id ?? null,
+      sessionId: options.sessionId ?? req?.params?.sessionId ?? null,
+      projectId: options.projectId ?? req?.params?.projectId ?? task?.project_id ?? null,
+      taskId: options.taskId ?? req?.params?.taskId ?? null,
+      nodeId: options.nodeId ?? req?.params?.nodeId ?? task?.result_node_id ?? null,
+      sourceNodeId: options.sourceNodeId ?? task?.source_node_id ?? null,
+      providerTaskId: options.providerTaskId ?? options.upstreamTaskId ?? task?.upstream_task_id ?? null,
+      eventId: options.eventId || null,
+      route: options.route || req?.originalUrl || req?.url || "",
+      method: options.method || req?.method || "",
+      action: options.action || "request",
+      status: options.status || task?.status || "",
+      message: redactString(String(options.message || "").slice(0, 600)),
+      hasError: options.hasError ? 1 : 0,
+    });
+  } catch {
+    // Request logging is intentionally best-effort.
+  }
+}
+
 function createErrorEvent(req, error, options = {}) {
   const eventId = options.eventId || id("err");
   const debug = options.debug || error?.debug || {};
@@ -612,6 +711,20 @@ function createErrorEvent(req, error, options = {}) {
     fullLogPath: fullPath,
   });
   fs.appendFileSync(todayLogFile(), `${JSON.stringify(summary)}\n`);
+  recordRequestLog(req, {
+    action: options.logAction || "error",
+    requestId: event.requestId,
+    userId: event.userId,
+    sessionId: event.sessionId,
+    projectId: event.projectId,
+    taskId: event.taskId,
+    nodeId: event.nodeId,
+    providerTaskId: event.providerTaskId,
+    eventId: event.id,
+    status: event.code,
+    message: event.message,
+    hasError: true,
+  });
   return { eventId: event.id, requestId: event.requestId, code: event.code };
 }
 
@@ -683,6 +796,8 @@ function publicUser(userId) {
   return {
     id: user.id,
     email: user.email,
+    isAdmin: Boolean(user.is_admin),
+    passwordResetRequired: Boolean(user.must_reset_password),
     createdAt: user.created_at,
     apiKey: key
       ? {
@@ -720,7 +835,37 @@ function requireAuth(req, res, next) {
     return;
   }
 
-  req.user = { id: session.user_id, email: session.email };
+  req.user = {
+    id: session.user_id,
+    email: session.email,
+    isAdmin: Boolean(session.is_admin),
+    passwordResetRequired: Boolean(session.must_reset_password),
+  };
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user?.isAdmin) {
+    const error = new Error("需要管理员权限。");
+    error.statusCode = 403;
+    error.code = "ADMIN_REQUIRED";
+    sendLoggedError(req, res, error, { source: "auth", statusCode: 403 });
+    return;
+  }
+  next();
+}
+
+function requireAdminReady(req, res, next) {
+  if (req.user?.passwordResetRequired) {
+    res.status(403).json({
+      error: {
+        message: "首次登录需要先重置管理员密码。",
+        code: "ADMIN_PASSWORD_RESET_REQUIRED",
+        requestId: req.requestId,
+      },
+    });
+    return;
+  }
   next();
 }
 
@@ -738,6 +883,7 @@ function requireProject(req, res, next) {
 }
 
 function toFlowNode(row) {
+  if (!row) return null;
   return {
     id: row.id,
     type: row.type,
@@ -749,6 +895,7 @@ function toFlowNode(row) {
 }
 
 function toFlowEdge(row) {
+  if (!row) return null;
   return {
     id: row.id,
     source: row.source_node_id,
@@ -781,6 +928,131 @@ function saveEdge(projectId, edge) {
     kind: edge.data?.kind || edge.kind || "render",
     dataJson: jsonStringify(edge.data || {}),
   });
+}
+
+const renderRuntimeFields = [
+  "status",
+  "progress",
+  "taskId",
+  "sourceNodeId",
+  "upstreamTaskId",
+  "videoUrl",
+  "resultUrl",
+  "lastFrameAssetId",
+  "error",
+  "errorCode",
+  "requestId",
+  "eventId",
+];
+
+function mergeRenderRuntimeData(projectId, node, existingRow) {
+  if (node.type !== "render" || !existingRow) return node;
+  const existingData = jsonParse(existingRow.data_json, {});
+  const nextData = { ...(node.data || {}) };
+  for (const field of renderRuntimeFields) {
+    if (existingData[field] !== undefined && existingData[field] !== null && existingData[field] !== "") {
+      nextData[field] = existingData[field];
+    }
+  }
+
+  const taskId = existingData.taskId || nextData.taskId;
+  const task = taskId ? statements.taskById.get(taskId) : null;
+  if (task?.project_id === projectId && task.result_node_id === node.id) {
+    const taskError = jsonParse(task.error_json, null);
+    nextData.taskId = task.id;
+    nextData.sourceNodeId = task.source_node_id;
+    nextData.upstreamTaskId = task.upstream_task_id || "";
+    nextData.status = task.status;
+    nextData.progress = task.progress;
+    nextData.videoUrl = task.video_url || nextData.videoUrl || "";
+    nextData.resultUrl = task.result_url || nextData.resultUrl || "";
+    nextData.lastFrameAssetId = task.last_frame_asset_id || nextData.lastFrameAssetId || "";
+    nextData.error = taskError?.message || nextData.error || "";
+  }
+
+  return { ...node, data: nextData };
+}
+
+function rowToNodeInput(row) {
+  return {
+    id: row.id,
+    type: row.type,
+    position: { x: row.x, y: row.y },
+    width: row.width,
+    height: row.height,
+    data: jsonParse(row.data_json, {}),
+  };
+}
+
+function rowToEdgeInput(row) {
+  return {
+    id: row.id,
+    source: row.source_node_id,
+    target: row.target_node_id,
+    kind: row.kind,
+    data: jsonParse(row.data_json, {}),
+  };
+}
+
+function shouldPreserveRuntimeNode(row) {
+  if (!row || row.type !== "render") return false;
+  const data = jsonParse(row.data_json, {});
+  const task = data.taskId ? statements.taskById.get(data.taskId) : null;
+  const status = task?.status || data.status;
+  return Boolean(data.taskId && ["queued", "submitted", "in_progress"].includes(status));
+}
+
+function ensureRenderNode(projectId, fallbackNode, patch = {}) {
+  const row = statements.nodeById.get(fallbackNode.id, projectId);
+  if (!row) {
+    saveNode(projectId, { ...fallbackNode, data: { ...(fallbackNode.data || {}), ...patch } });
+  } else if (Object.keys(patch).length) {
+    updateRenderNode(projectId, fallbackNode.id, patch);
+  }
+  return statements.nodeById.get(fallbackNode.id, projectId);
+}
+
+function ensureRenderEdge(projectId, fallbackEdge) {
+  const row = statements.edgeById.get(fallbackEdge.id, projectId);
+  if (!row) saveEdge(projectId, fallbackEdge);
+  return statements.edgeById.get(fallbackEdge.id, projectId);
+}
+
+function ensureTaskRenderArtifacts(task) {
+  if (!task?.project_id || !task.result_node_id) return;
+  let row = statements.nodeById.get(task.result_node_id, task.project_id);
+  if (!row) {
+    const sourceRow = statements.nodeById.get(task.source_node_id, task.project_id);
+    const errorData = jsonParse(task.error_json, null);
+    saveNode(task.project_id, {
+      id: task.result_node_id,
+      type: "render",
+      position: { x: (sourceRow?.x ?? 0) + 420, y: sourceRow?.y ?? 120 },
+      data: {
+        title: "生成结果",
+        status: task.status,
+        progress: task.progress ?? 0,
+        taskId: task.id,
+        sourceNodeId: task.source_node_id,
+        upstreamTaskId: task.upstream_task_id || "",
+        videoUrl: task.video_url || "",
+        resultUrl: task.result_url || "",
+        lastFrameAssetId: task.last_frame_asset_id || "",
+        error: errorData?.message || "",
+      },
+    });
+    row = statements.nodeById.get(task.result_node_id, task.project_id);
+  }
+
+  if (task.source_node_id && !statements.edgeForPair.get(task.project_id, task.source_node_id, task.result_node_id)) {
+    saveEdge(task.project_id, {
+      id: id("edge"),
+      source: task.source_node_id,
+      target: task.result_node_id,
+      kind: "render",
+      data: { kind: "render" },
+    });
+  }
 }
 
 function defaultShotData(overrides = {}) {
@@ -833,6 +1105,46 @@ function makeProject(userId, name = "我的连续视频") {
   statements.createProject.run(projectId, userId, name);
   createSampleCanvas(projectId);
   return statements.projectById.get(projectId, userId);
+}
+
+function ensureAdminAccount() {
+  const email = String(process.env.ADMIN_EMAIL || "admin@example.com").trim().toLowerCase();
+  const initialPassword = String(process.env.ADMIN_INITIAL_PASSWORD || "ChangeMe123!");
+  const existing = statements.userByEmail.get(email);
+  if (existing) {
+    if (!existing.is_admin) statements.promoteAdminUser.run(existing.id);
+    return;
+  }
+  const passwordHash = bcrypt.hashSync(initialPassword, 12);
+  statements.createAdminUser.run(email, passwordHash);
+  console.log(`Admin account ready: ${email} (initial password must be reset after first login)`);
+}
+
+function backfillRequestLogs() {
+  const rows = db.prepare(`
+    SELECT generation_tasks.*
+    FROM generation_tasks
+    WHERE NOT EXISTS (
+      SELECT 1 FROM request_logs
+      WHERE request_logs.task_id = generation_tasks.id
+        AND request_logs.action = 'task_backfill'
+    )
+  `).all();
+  for (const task of rows) {
+    recordRequestLog(null, {
+      action: "task_backfill",
+      requestId: id("req"),
+      userId: task.user_id,
+      projectId: task.project_id,
+      taskId: task.id,
+      nodeId: task.result_node_id,
+      sourceNodeId: task.source_node_id,
+      providerTaskId: task.upstream_task_id,
+      status: task.status,
+      message: "历史生成任务索引",
+      hasError: task.status === "failed",
+    });
+  }
 }
 
 function normalizeStatus(status) {
@@ -940,7 +1252,14 @@ function buildGenerationPayload(data) {
   const duration = Math.min(Math.max(Number(data.duration || 5), 3), 15);
   const [width, height] = ratioToSize(data.ratio);
   const seed = data.seed === "" || data.seed === undefined ? undefined : Number(data.seed);
-  const referenceImage = String(data.firstFrameUrl || data.referenceImageUrl || "").trim();
+  const firstFrame = String(data.firstFrameUrl || data.referenceImageUrl || "").trim();
+  const lastFrame = String(data.lastFrameUrl || "").trim();
+  if (lastFrame && !firstFrame) {
+    const error = new Error("使用尾帧时需要同时提供首帧或参考图。");
+    error.statusCode = 400;
+    throw error;
+  }
+  const imageUrls = [firstFrame, lastFrame].filter(Boolean);
 
   const metadata = {
     ratio: data.ratio || "16:9",
@@ -952,8 +1271,8 @@ function buildGenerationPayload(data) {
   };
 
   if (Number.isFinite(seed)) metadata.seed = seed;
-  if (data.firstFrameUrl) metadata.first_frame_url = data.firstFrameUrl;
-  if (data.lastFrameUrl) metadata.last_frame_url = data.lastFrameUrl;
+  if (firstFrame) metadata.first_frame_url = firstFrame;
+  if (lastFrame) metadata.last_frame_url = lastFrame;
   if (data.referenceImageUrl) metadata.reference_image_url = data.referenceImageUrl;
 
   const payload = {
@@ -966,14 +1285,19 @@ function buildGenerationPayload(data) {
     metadata,
   };
 
-  if (referenceImage) {
-    payload.image = referenceImage;
+  if (imageUrls.length) {
+    payload.image = imageUrls[0];
+    payload.image_urls = imageUrls;
+    metadata.input_mode = imageUrls.length > 1 ? "first_last_frame" : "image_to_video";
   }
 
   return payload;
 }
 
 function resolveProviderImageInput(userId, value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => resolveProviderImageInput(userId, item));
+  }
   const raw = String(value || "").trim();
   if (!raw.startsWith("/api/assets/")) return raw;
 
@@ -986,6 +1310,16 @@ function resolveProviderImageInput(userId, value) {
   const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
   const base64 = fs.readFileSync(asset.file_path).toString("base64");
   return `data:${mime};base64,${base64}`;
+}
+
+function resolveProviderImageInputs(userId, payload) {
+  if (payload.image) {
+    payload.image = resolveProviderImageInput(userId, payload.image);
+  }
+  if (payload.image_urls) {
+    payload.image_urls = resolveProviderImageInput(userId, payload.image_urls);
+  }
+  return payload;
 }
 
 async function callProvider(userId, method, pathname, payload) {
@@ -1106,8 +1440,9 @@ function updateRenderNode(projectId, nodeId, patch) {
   });
 }
 
-async function refreshTask(task, userId, req = null) {
-  if (!task.upstream_task_id || ["completed", "failed", "cancelled", "expired"].includes(task.status)) {
+async function refreshTask(task, userId, req = null, options = {}) {
+  const terminal = ["completed", "cancelled", "expired"].includes(task.status) || (task.status === "failed" && !options.force);
+  if (!task.upstream_task_id || terminal) {
     return task;
   }
 
@@ -1135,7 +1470,11 @@ async function refreshTask(task, userId, req = null) {
       normalized.progress ?? task.progress,
       jsonStringify(safeJson(body)),
       jsonStringify(debug),
-      normalized.failReason && nextStatus === "failed" ? jsonStringify({ message: normalized.failReason }) : task.error_json,
+      normalized.failReason && nextStatus === "failed"
+        ? jsonStringify({ message: normalized.failReason })
+        : nextStatus === "completed"
+          ? null
+          : task.error_json,
       normalized.videoUrl || task.video_url,
       normalized.resultUrl || task.result_url,
       lastFrameAssetId,
@@ -1143,6 +1482,8 @@ async function refreshTask(task, userId, req = null) {
       task.id,
     );
 
+    const latestTask = statements.taskById.get(task.id);
+    ensureTaskRenderArtifacts(latestTask);
     updateRenderNode(task.project_id, task.result_node_id, {
       status: nextStatus,
       progress: normalized.progress ?? task.progress,
@@ -1150,6 +1491,19 @@ async function refreshTask(task, userId, req = null) {
       resultUrl: normalized.resultUrl || task.result_url,
       lastFrameAssetId,
       error: nextStatus === "failed" ? normalized.failReason : "",
+    });
+
+    recordRequestLog(req, {
+      action: options.action || "task_refresh",
+      userId,
+      projectId: task.project_id,
+      taskId: task.id,
+      nodeId: task.result_node_id,
+      sourceNodeId: task.source_node_id,
+      providerTaskId: task.upstream_task_id,
+      status: nextStatus,
+      message: nextStatus === "completed" ? "生成结果已拉取" : "生成任务状态已刷新",
+      hasError: nextStatus === "failed",
     });
 
     return statements.taskById.get(task.id);
@@ -1166,6 +1520,7 @@ async function refreshTask(task, userId, req = null) {
         projectId: task.project_id,
         taskId: task.id,
         nodeId: task.result_node_id,
+        providerTaskId: task.upstream_task_id,
         request: { taskId: task.id, upstreamTaskId: task.upstream_task_id },
         response: { message: error.message, upstream: error.upstream },
         debug: error.debug,
@@ -1186,6 +1541,7 @@ async function refreshTask(task, userId, req = null) {
 }
 
 function taskResponse(task) {
+  if (!task) return null;
   return {
     id: task.id,
     projectId: task.project_id,
@@ -1204,6 +1560,42 @@ function taskResponse(task) {
   };
 }
 
+function requestLogRowToSummary(row) {
+  return {
+    id: row.id,
+    requestId: row.request_id,
+    userId: row.user_id,
+    userEmail: row.user_email || "",
+    sessionId: row.session_id,
+    projectId: row.project_id,
+    taskId: row.task_id,
+    nodeId: row.node_id,
+    sourceNodeId: row.source_node_id,
+    providerTaskId: row.provider_task_id || row.upstream_task_id || "",
+    eventId: row.event_id,
+    route: row.route,
+    method: row.method,
+    action: row.action,
+    status: row.status || row.task_status || "",
+    taskStatus: row.task_status || "",
+    message: row.message,
+    hasError: Boolean(row.has_error),
+    hasVideo: Boolean(row.video_url || row.result_url),
+    createdAt: row.created_at,
+  };
+}
+
+function adminTaskResponse(task) {
+  if (!task) return null;
+  return {
+    ...taskResponse(task),
+    userId: task.user_id,
+    userEmail: task.user_email || "",
+  };
+}
+
+ensureAdminAccount();
+backfillRequestLogs();
 statements.cleanupSessions.run();
 
 app.post("/api/auth/register", async (req, res) => {
@@ -1257,6 +1649,51 @@ app.post("/api/auth/login", async (req, res) => {
     statements.createSession.run(sessionId, user.id, expiresAt);
     setSessionCookie(res, sessionId, expiresAt);
     res.json({ user: publicUser(user.id) });
+  } catch (error) {
+    res.status(500).json({ error: { message: error.message } });
+  }
+});
+
+app.post("/api/admin/auth/login", async (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+    const user = statements.userByEmail.get(email);
+    if (!user || !user.is_admin || !(await bcrypt.compare(password, user.password_hash))) {
+      res.status(401).json({ error: { message: "管理员账号或密码不正确。" } });
+      return;
+    }
+    const sessionId = id("session");
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 14).toISOString();
+    statements.createSession.run(sessionId, user.id, expiresAt);
+    setSessionCookie(res, sessionId, expiresAt);
+    res.json({ user: publicUser(user.id), resetRequired: Boolean(user.must_reset_password) });
+  } catch (error) {
+    res.status(500).json({ error: { message: error.message } });
+  }
+});
+
+app.post("/api/admin/password", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const currentPassword = String(req.body.currentPassword || "");
+    const newPassword = String(req.body.newPassword || "");
+    const confirmPassword = String(req.body.confirmPassword || "");
+    const user = statements.userByEmail.get(req.user.email);
+    if (!user || !(await bcrypt.compare(currentPassword, user.password_hash))) {
+      res.status(400).json({ error: { message: "当前密码不正确。" } });
+      return;
+    }
+    if (newPassword.length < 10) {
+      res.status(400).json({ error: { message: "新密码至少需要 10 位。" } });
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      res.status(400).json({ error: { message: "两次新密码不一致。" } });
+      return;
+    }
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    statements.updateUserPassword.run(passwordHash, 0, req.user.id);
+    res.json({ user: publicUser(req.user.id) });
   } catch (error) {
     res.status(500).json({ error: { message: error.message } });
   }
@@ -1423,6 +1860,62 @@ app.patch("/api/error-events/:eventId", requireAuth, (req, res) => {
   statements.patchErrorEvent.run(Boolean(req.body.resolved), req.params.eventId, req.user.id);
   const row = statements.errorEventForUser.get(req.params.eventId, req.user.id);
   res.json({ event: errorRowToDetail(row) });
+});
+
+app.get("/api/admin/request-logs", requireAuth, requireAdmin, requireAdminReady, (req, res) => {
+  const filters = {
+    taskId: String(req.query.taskId || "").trim(),
+    requestId: String(req.query.requestId || "").trim(),
+    eventId: String(req.query.eventId || "").trim(),
+    nodeId: String(req.query.nodeId || "").trim(),
+    userId: String(req.query.userId || "").trim(),
+    hasError: req.query.hasError === undefined || req.query.hasError === "" ? "" : req.query.hasError === "true" || req.query.hasError === "1" ? 1 : 0,
+    limit: Math.min(Math.max(Number(req.query.limit || 120), 1), 500),
+  };
+  const logs = statements.adminRequestLogs.all(
+    filters.taskId,
+    filters.taskId,
+    filters.taskId,
+    filters.requestId,
+    filters.requestId,
+    filters.eventId,
+    filters.eventId,
+    filters.nodeId,
+    filters.nodeId,
+    filters.nodeId,
+    filters.userId,
+    filters.userId,
+    filters.hasError,
+    filters.hasError,
+    filters.limit,
+  ).map(requestLogRowToSummary);
+  res.json({ logs });
+});
+
+app.get("/api/admin/tasks/:taskId", requireAuth, requireAdmin, requireAdminReady, async (req, res) => {
+  const taskId = String(req.params.taskId || "").trim();
+  let task = statements.adminTaskById.get(taskId, taskId);
+  if (!task) {
+    res.status(404).json({ error: { message: "Task ID 不存在。", code: "TASK_NOT_FOUND", requestId: req.requestId } });
+    return;
+  }
+  if (req.query.refresh === "1" || req.query.refresh === "true") {
+    await refreshTask(task, task.user_id, req, { force: true, action: "admin_task_query" });
+    task = statements.adminTaskById.get(task.id, task.id);
+  }
+  const logs = statements.adminRequestLogsForTask.all(task.id).map(requestLogRowToSummary);
+  const events = statements.adminErrorEventsForTask.all(task.id).map((row) => ({
+    eventId: row.id,
+    requestId: row.request_id,
+    taskId: row.task_id,
+    nodeId: row.node_id,
+    providerTaskId: row.provider_task_id,
+    code: row.code,
+    message: row.message,
+    severity: row.severity,
+    createdAt: row.created_at,
+  }));
+  res.json({ task: adminTaskResponse(task), logs, events });
 });
 
 app.put("/api/me/api-key", requireAuth, (req, res) => {
@@ -1670,6 +2163,7 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
   let taskIdValue;
   let resultNodeId;
   let sourceNodeId;
+  let linkedProjectId;
   try {
     const latestPlan = statements.latestCreationPlan.get(session.id);
     const plan = { ...(latestPlan ? jsonParse(latestPlan.plan_json, {}) : {}), ...(req.body.plan || {}) };
@@ -1688,11 +2182,12 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
       motionStrength: plan.motionStrength || "medium",
     });
     payload = buildGenerationPayload(shotData);
-    if (payload.image) payload.image = resolveProviderImageInput(req.user.id, payload.image);
+    payload = resolveProviderImageInputs(req.user.id, payload);
 
     const linkedProject = session.linked_project_id
       ? statements.projectById.get(session.linked_project_id, req.user.id)
       : makeProject(req.user.id, `${session.title} · 专业画布`);
+    linkedProjectId = linkedProject.id;
     sourceNodeId = id("shot");
     resultNodeId = id("render");
     taskIdValue = id("task");
@@ -1715,6 +2210,16 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
       if (latestPlan?.id) statements.updateCreationPlanStatus.run("submitted", latestPlan.id, session.id);
     });
     createLocal();
+    recordRequestLog(req, {
+      action: "chat_generate_created",
+      sessionId: session.id,
+      projectId: linkedProject.id,
+      taskId: taskIdValue,
+      nodeId: resultNodeId,
+      sourceNodeId,
+      status: "queued",
+      message: "对话生成任务已创建",
+    });
 
     const { body, debug } = await callProvider(req.user.id, "POST", "/v1/video/generations", payload);
     const normalized = normalizeTask(body);
@@ -1726,23 +2231,38 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
     }
     statements.updateTaskSubmitted.run(normalized.upstreamTaskId, normalized.status, normalized.progress ?? 0, jsonStringify(safeJson(body)), jsonStringify(debug), taskIdValue);
     updateRenderNode(linkedProject.id, resultNodeId, { status: normalized.status, progress: normalized.progress ?? 0, upstreamTaskId: normalized.upstreamTaskId });
-    res.status(201).json({ task: taskResponse(statements.taskById.get(taskIdValue)), projectId: linkedProject.id, resultNodeId, sourceNodeId });
-  } catch (error) {
-    if (taskIdValue) {
-      statements.updateTaskError.run(jsonStringify({ message: error.message, upstream: error.upstream }), jsonStringify(error.debug || {}), taskIdValue);
-      if (resultNodeId && session.linked_project_id) updateRenderNode(session.linked_project_id, resultNodeId, { status: "failed", error: error.message });
-    }
-    const logged = createErrorEvent(req, error, {
-      source: "provider",
-      code: error.code || "CHAT_GENERATE_FAILED",
+    recordRequestLog(req, {
+      action: "chat_generate_submitted",
       sessionId: session.id,
-      projectId: session.linked_project_id,
+      projectId: linkedProject.id,
       taskId: taskIdValue,
       nodeId: resultNodeId,
+      sourceNodeId,
+      providerTaskId: normalized.upstreamTaskId,
+      status: normalized.status,
+      message: "对话上游任务已提交",
+    });
+    res.status(201).json({ task: taskResponse(statements.taskById.get(taskIdValue)), projectId: linkedProject.id, resultNodeId, sourceNodeId });
+  } catch (error) {
+    const currentTask = taskIdValue ? statements.taskById.get(taskIdValue) : null;
+    const hasProviderTask = Boolean(currentTask?.upstream_task_id);
+    if (taskIdValue && !hasProviderTask) {
+      statements.updateTaskError.run(jsonStringify({ message: error.message, upstream: error.upstream }), jsonStringify(error.debug || {}), taskIdValue);
+      if (resultNodeId && linkedProjectId) updateRenderNode(linkedProjectId, resultNodeId, { status: "failed", error: error.message });
+    }
+    const logged = createErrorEvent(req, error, {
+      source: hasProviderTask ? "backend" : "provider",
+      severity: hasProviderTask ? "warning" : "error",
+      code: error.code || (hasProviderTask ? "CHAT_RESPONSE_RECOVERED" : "CHAT_GENERATE_FAILED"),
+      sessionId: session.id,
+      projectId: linkedProjectId || session.linked_project_id,
+      taskId: taskIdValue,
+      nodeId: resultNodeId,
+      providerTaskId: currentTask?.upstream_task_id,
       request: { body: req.body, payload },
       debug: error.debug,
       response: { message: error.message, upstream: error.upstream },
-      statusCode: error.statusCode || 500,
+      statusCode: hasProviderTask ? 202 : error.statusCode || 500,
     });
     if (taskIdValue) {
       statements.createCreationMessage.run(
@@ -1752,6 +2272,16 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
         "error",
         jsonStringify({ message: error.message, code: logged.code, requestId: logged.requestId, eventId: logged.eventId, taskId: taskIdValue }),
       );
+    }
+    if (hasProviderTask) {
+      res.status(202).json({
+        task: taskResponse(statements.taskById.get(taskIdValue)),
+        projectId: linkedProjectId || session.linked_project_id,
+        resultNodeId,
+        sourceNodeId,
+        warning: { message: error.message, code: logged.code, requestId: logged.requestId, eventId: logged.eventId },
+      });
+      return;
     }
     res.status(error.statusCode || 500).json({ error: { message: error.message, code: logged.code, requestId: logged.requestId, eventId: logged.eventId, taskId: taskIdValue } });
   }
@@ -1861,11 +2391,26 @@ app.put("/api/projects/:projectId/canvas", requireAuth, requireProject, (req, re
   const nodes = Array.isArray(req.body.nodes) ? req.body.nodes : [];
   const edges = Array.isArray(req.body.edges) ? req.body.edges : [];
   const viewport = req.body.viewport || { x: 0, y: 0, zoom: 1 };
+  const existingNodes = new Map(statements.nodesForProject.all(req.project.id).map((node) => [node.id, node]));
+  const existingEdges = statements.edgesForProject.all(req.project.id);
+  const incomingNodeIds = new Set(nodes.map((node) => node.id).filter(Boolean));
+  const incomingEdgeIds = new Set(edges.map((edge) => edge.id).filter(Boolean));
+  const preservedNodes = Array.from(existingNodes.values()).filter((node) => !incomingNodeIds.has(node.id) && shouldPreserveRuntimeNode(node));
+  const preservedNodeIds = new Set(preservedNodes.map((node) => node.id));
+  const nodeIdsAfterSave = new Set([...incomingNodeIds, ...preservedNodeIds]);
+  const preservedEdges = existingEdges.filter((edge) => (
+    !incomingEdgeIds.has(edge.id) &&
+    nodeIdsAfterSave.has(edge.source_node_id) &&
+    nodeIdsAfterSave.has(edge.target_node_id) &&
+    (preservedNodeIds.has(edge.source_node_id) || preservedNodeIds.has(edge.target_node_id))
+  ));
   const saveCanvas = db.transaction(() => {
     statements.deleteEdgesForProject.run(req.project.id);
     statements.deleteNodesForProject.run(req.project.id);
-    for (const node of nodes) saveNode(req.project.id, node);
+    for (const node of nodes) saveNode(req.project.id, mergeRenderRuntimeData(req.project.id, node, existingNodes.get(node.id)));
+    for (const node of preservedNodes) saveNode(req.project.id, rowToNodeInput(node));
     for (const edge of edges) saveEdge(req.project.id, edge);
+    for (const edge of preservedEdges) saveEdge(req.project.id, rowToEdgeInput(edge));
     statements.updateProjectViewport.run(jsonStringify(viewport), req.project.id);
   });
   saveCanvas();
@@ -1921,9 +2466,7 @@ app.post("/api/projects/:projectId/nodes/:nodeId/generate", requireAuth, require
   const sourceData = { ...jsonParse(sourceNode.data_json, {}), ...(req.body.data || {}) };
   try {
     payload = buildGenerationPayload(sourceData);
-    if (payload.image) {
-      payload.image = resolveProviderImageInput(req.user.id, payload.image);
-    }
+    payload = resolveProviderImageInputs(req.user.id, payload);
   } catch (error) {
     res.status(error.statusCode || 400).json({ error: { message: error.message } });
     return;
@@ -1973,6 +2516,15 @@ app.post("/api/projects/:projectId/nodes/:nodeId/generate", requireAuth, require
     );
   });
   createLocalTask();
+  recordRequestLog(req, {
+    action: "node_generate_created",
+    projectId: req.project.id,
+    taskId: localTaskId,
+    nodeId: resultNodeId,
+    sourceNodeId: sourceNode.id,
+    status: "queued",
+    message: "本地生成任务已创建",
+  });
 
   try {
     const { body, debug } = await callProvider(req.user.id, "POST", "/v1/video/generations", payload);
@@ -1997,36 +2549,73 @@ app.post("/api/projects/:projectId/nodes/:nodeId/generate", requireAuth, require
       videoUrl: normalized.videoUrl || "",
       resultUrl: normalized.resultUrl || "",
     });
-    const task = statements.taskById.get(localTaskId);
-    res.status(201).json({ task: taskResponse(task), node: toFlowNode(statements.nodeById.get(resultNodeId, req.project.id)), edge: toFlowEdge(statements.edgesForProject.all(req.project.id).find((item) => item.id === edgeId)) });
-  } catch (error) {
-    statements.updateTaskError.run(
-      jsonStringify({ message: error.message, upstream: error.upstream }),
-      jsonStringify(error.debug || {}),
-      localTaskId,
-    );
-    updateRenderNode(req.project.id, resultNodeId, {
-      status: "failed",
-      error: error.message,
-      errorCode: error.code || inferErrorCode(error, "NODE_GENERATE_FAILED"),
-      requestId: req.requestId,
-    });
-    const logged = createErrorEvent(req, error, {
-      source: "provider",
-      code: error.code || "NODE_GENERATE_FAILED",
+    recordRequestLog(req, {
+      action: "node_generate_submitted",
       projectId: req.project.id,
       taskId: localTaskId,
       nodeId: resultNodeId,
+      sourceNodeId: sourceNode.id,
+      providerTaskId: normalized.upstreamTaskId,
+      status: normalized.status,
+      message: "上游生成任务已提交",
+    });
+    const task = statements.taskById.get(localTaskId);
+    const nodeRow = ensureRenderNode(req.project.id, resultNode, {
+      status: normalized.status,
+      progress: normalized.progress ?? 0,
+      upstreamTaskId: normalized.upstreamTaskId,
+      videoUrl: normalized.videoUrl || "",
+      resultUrl: normalized.resultUrl || "",
+    });
+    const edgeRow = ensureRenderEdge(req.project.id, edge);
+    res.status(201).json({ task: taskResponse(task), node: toFlowNode(nodeRow), edge: toFlowEdge(edgeRow) });
+  } catch (error) {
+    const currentTask = statements.taskById.get(localTaskId);
+    const hasProviderTask = Boolean(currentTask?.upstream_task_id);
+    if (!hasProviderTask) {
+      statements.updateTaskError.run(
+        jsonStringify({ message: error.message, upstream: error.upstream }),
+        jsonStringify(error.debug || {}),
+        localTaskId,
+      );
+      updateRenderNode(req.project.id, resultNodeId, {
+        status: "failed",
+        error: error.message,
+        errorCode: error.code || inferErrorCode(error, "NODE_GENERATE_FAILED"),
+        requestId: req.requestId,
+      });
+    }
+    const logged = createErrorEvent(req, error, {
+      source: hasProviderTask ? "backend" : "provider",
+      severity: hasProviderTask ? "warning" : "error",
+      code: error.code || (hasProviderTask ? "NODE_RESPONSE_RECOVERED" : "NODE_GENERATE_FAILED"),
+      projectId: req.project.id,
+      taskId: localTaskId,
+      nodeId: resultNodeId,
+      providerTaskId: currentTask?.upstream_task_id,
       request: { body: req.body, payload },
       response: { message: error.message, upstream: error.upstream },
       debug: error.debug,
-      statusCode: error.statusCode || 500,
+      statusCode: hasProviderTask ? 202 : error.statusCode || 500,
     });
-    updateRenderNode(req.project.id, resultNodeId, {
+    const nodeRow = ensureRenderNode(req.project.id, resultNode, {
+      status: hasProviderTask ? currentTask.status : "failed",
+      error: hasProviderTask ? "" : error.message,
       errorCode: logged.code,
       requestId: logged.requestId,
       eventId: logged.eventId,
+      upstreamTaskId: currentTask?.upstream_task_id || "",
     });
+    const edgeRow = ensureRenderEdge(req.project.id, edge);
+    if (hasProviderTask) {
+      res.status(202).json({
+        task: taskResponse(statements.taskById.get(localTaskId)),
+        node: toFlowNode(nodeRow),
+        edge: toFlowEdge(edgeRow),
+        warning: { message: error.message, code: logged.code, requestId: logged.requestId, eventId: logged.eventId },
+      });
+      return;
+    }
     res.status(error.statusCode || 500).json({
       error: {
         message: error.message,
@@ -2034,8 +2623,8 @@ app.post("/api/projects/:projectId/nodes/:nodeId/generate", requireAuth, require
         requestId: logged.requestId,
         eventId: logged.eventId,
         task: taskResponse(statements.taskById.get(localTaskId)),
-        node: toFlowNode(statements.nodeById.get(resultNodeId, req.project.id)),
-        edge: toFlowEdge(statements.edgesForProject.all(req.project.id).find((item) => item.id === edgeId)),
+        node: toFlowNode(nodeRow),
+        edge: toFlowEdge(edgeRow),
         upstream: error.upstream,
         debug: error.debug,
       },
@@ -2096,7 +2685,10 @@ app.get("/api/tasks/:taskId", requireAuth, async (req, res) => {
     res.status(404).json({ error: { message: "任务不存在。" } });
     return;
   }
-  const refreshed = await refreshTask(task, req.user.id, req);
+  const refreshed = await refreshTask(task, req.user.id, req, {
+    force: req.query.force === "1" || req.query.force === "true",
+    action: req.query.force ? "task_force_refresh" : "task_refresh",
+  });
   res.json({ task: taskResponse(refreshed) });
 });
 
