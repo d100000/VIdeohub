@@ -36,6 +36,36 @@ const fullLogDir = path.join(logDir, "full");
 const distDir = path.join(__dirname, "dist");
 const publicDir = path.join(__dirname, "public");
 
+function formatTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join("");
+}
+
+function readFrontendAssetVersion() {
+  if (process.env.FRONTEND_ASSET_VERSION || process.env.BUILD_TIMESTAMP) {
+    return String(process.env.FRONTEND_ASSET_VERSION || process.env.BUILD_TIMESTAMP);
+  }
+  const versionFile = path.join(distDir, "frontend-version.json");
+  if (fs.existsSync(versionFile)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(versionFile, "utf8"));
+      if (parsed?.version) return String(parsed.version);
+    } catch {
+      return formatTimestamp();
+    }
+  }
+  return formatTimestamp();
+}
+
+const frontendAssetVersion = readFrontendAssetVersion();
+
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(assetDir, { recursive: true });
 fs.mkdirSync(fullLogDir, { recursive: true });
@@ -3232,10 +3262,67 @@ app.get("/api/config", (_req, res) => {
 });
 
 const staticDir = fs.existsSync(distDir) ? distDir : publicDir;
+const frontendAssetPattern = /\.(?:js|mjs|css|png|jpe?g|webp|gif|svg|ico|woff2?|ttf|otf)(?:[?#]|$)/i;
+
+function versionFrontendAssetPath(value) {
+  if (
+    !value ||
+    value.startsWith("#") ||
+    value.startsWith("/api/") ||
+    /^(?:https?:)?\/\//.test(value) ||
+    /^(?:data|blob):/.test(value) ||
+    !frontendAssetPattern.test(value)
+  ) {
+    return value;
+  }
+  const [pathPart, hashPart] = value.split("#");
+  if (/[?&]v=/.test(pathPart)) return value;
+  const separator = pathPart.includes("?") ? "&" : "?";
+  return `${pathPart}${separator}v=${encodeURIComponent(frontendAssetVersion)}${hashPart ? `#${hashPart}` : ""}`;
+}
+
+function versionFrontendAssetReferences(html) {
+  return String(html).replace(/\b(src|href)=("|')([^"']+)\2/g, (match, attr, quote, value) => {
+    const versioned = versionFrontendAssetPath(value);
+    return `${attr}=${quote}${versioned}${quote}`;
+  });
+}
+
+function staticHtmlPath(requestPath = "/index.html") {
+  const relativePath = decodeURIComponent(requestPath).replace(/^\/+/, "") || "index.html";
+  const resolved = path.resolve(staticDir, relativePath);
+  const root = path.resolve(staticDir);
+  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) return null;
+  return resolved;
+}
+
+function sendVersionedHtml(res, filePath) {
+  fs.readFile(filePath, "utf8", (error, html) => {
+    if (error) {
+      res.status(error.code === "ENOENT" ? 404 : 500).send(error.code === "ENOENT" ? "Not found" : "Unable to read HTML");
+      return;
+    }
+    res.type("html").send(versionFrontendAssetReferences(html));
+  });
+}
+
+app.get("/", (_req, res) => {
+  sendVersionedHtml(res, path.join(staticDir, "index.html"));
+});
+
+app.get("/*.html", (req, res, next) => {
+  const filePath = staticHtmlPath(req.path);
+  if (!filePath || !fs.existsSync(filePath)) {
+    next();
+    return;
+  }
+  sendVersionedHtml(res, filePath);
+});
+
 app.use(express.static(staticDir));
 
 app.get("*", (_req, res) => {
-  res.sendFile(path.join(staticDir, "index.html"));
+  sendVersionedHtml(res, path.join(staticDir, "index.html"));
 });
 
 app.listen(port, () => {

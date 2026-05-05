@@ -17,7 +17,22 @@ const buildTimestamp = process.env.BUILD_TIMESTAMP || formatBuildTimestamp();
 const versionedName = `assets/[name]-${buildTimestamp}-[hash]`;
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: "frontend-asset-version",
+      generateBundle() {
+        this.emitFile({
+          type: "asset",
+          fileName: "frontend-version.json",
+          source: `${JSON.stringify({ version: buildTimestamp })}\n`,
+        });
+      },
+    },
+  ],
+  define: {
+    __FRONTEND_ASSET_VERSION__: JSON.stringify(buildTimestamp),
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

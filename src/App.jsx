@@ -57,6 +57,8 @@ import { taskRecoveryAdvice, taskSourceLabel, taskStatusLabel } from "./taskLogi
 
 const providerBaseUrl = "https://www.taijiai.online/";
 const defaultModel = "seedance-2.0-720p";
+const frontendAssetVersion =
+  typeof __FRONTEND_ASSET_VERSION__ !== "undefined" ? __FRONTEND_ASSET_VERSION__ : "dev";
 
 const ratioOptions = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 const durationOptions = [3, 5, 8, 10, 15];
@@ -152,6 +154,13 @@ function copyText(value) {
 
 function assetUrl(assetId) {
   return assetId ? `/api/assets/${assetId}` : "";
+}
+
+function frontendAssetUrl(value) {
+  if (!value || /^(?:https?:)?\/\//.test(value) || /^(?:data|blob):/.test(value)) return value;
+  const [pathPart, hashPart] = value.split("#");
+  const separator = pathPart.includes("?") ? "&" : "?";
+  return `${pathPart}${separator}v=${encodeURIComponent(frontendAssetVersion)}${hashPart ? `#${hashPart}` : ""}`;
 }
 
 function fileToDataUrl(file) {
@@ -283,7 +292,7 @@ function cx(...classes) {
 function ProductLogo() {
   return (
     <span className="brand-mark logo-mark">
-      <img src="/assets/continuous-video-logo.svg" alt="" aria-hidden="true" />
+      <img src={frontendAssetUrl("/assets/continuous-video-logo.svg")} alt="" aria-hidden="true" />
     </span>
   );
 }
@@ -454,7 +463,7 @@ function HomePage({ me, reload }) {
           </div>
         </div>
         <div className="hero-device">
-          <img src="/assets/hero-canvas-workflow.png" alt="连续视频无限画布工作台预览" />
+          <img src={frontendAssetUrl("/assets/hero-canvas-workflow.png")} alt="连续视频无限画布工作台预览" />
         </div>
       </section>
 
