@@ -3,10 +3,13 @@ import cookieParser from "cookie-parser";
 import Database from "better-sqlite3";
 import dotenv from "dotenv";
 import express from "express";
+import dns from "node:dns/promises";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
+import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -35,6 +38,11 @@ const logDir = path.join(dataDir, "logs");
 const fullLogDir = path.join(logDir, "full");
 const distDir = path.join(__dirname, "dist");
 const publicDir = path.join(__dirname, "public");
+const oneWeekMs = 1000 * 60 * 60 * 24 * 7;
+const imageAssetCleanupRetentionMs = Math.max(Number(process.env.IMAGE_ASSET_CLEANUP_RETENTION_MS || oneWeekMs), 1000 * 60 * 60);
+const imageAssetCleanupIntervalMs = Math.max(Number(process.env.IMAGE_ASSET_CLEANUP_INTERVAL_MS || oneWeekMs), 1000 * 60 * 60);
+const imageUploadMaxBytes = Math.max(Number(process.env.IMAGE_UPLOAD_MAX_BYTES || 12 * 1024 * 1024), 1024 * 1024);
+const imageUploadMaxLabel = `${Math.round((imageUploadMaxBytes / 1024 / 1024) * 10) / 10}MB`;
 
 function formatTimestamp(date = new Date()) {
   const pad = (value) => String(value).padStart(2, "0");
@@ -74,14 +82,14 @@ const db = new Database(path.join(dataDir, "app.db"));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
-app.use(express.json({ limit: "18mb" }));
-app.use(cookieParser(appSecret));
 app.use((req, res, next) => {
   req.requestId = String(req.get("X-Request-Id") || id("req"));
   req.startedAt = Date.now();
   res.setHeader("X-Request-Id", req.requestId);
   next();
 });
+app.use(express.json({ limit: "18mb" }));
+app.use(cookieParser(appSecret));
 
 function ensureColumn(tableName, columnName, definition) {
   const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
@@ -422,7 +430,15 @@ const statements = {
     INSERT INTO assets (id, project_id, user_id, type, source, url, file_path, metadata_json)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `),
+  assetById: db.prepare("SELECT * FROM assets WHERE id = ?"),
   assetForUser: db.prepare("SELECT * FROM assets WHERE id = ? AND user_id = ?"),
+  assetsBefore: db.prepare("SELECT * FROM assets WHERE file_path IS NOT NULL AND created_at <= ? ORDER BY created_at ASC"),
+  deleteAsset: db.prepare("DELETE FROM assets WHERE id = ?"),
+  taskAssetReferences: db.prepare(`
+    SELECT first_frame_asset_id, last_frame_asset_id
+    FROM generation_tasks
+    WHERE first_frame_asset_id IS NOT NULL OR last_frame_asset_id IS NOT NULL
+  `),
   completedTasksForProject: db.prepare(`
     SELECT generation_tasks.*, canvas_nodes.x, canvas_nodes.y
     FROM generation_tasks
@@ -1376,35 +1392,117 @@ function buildGenerationPayload(data) {
   return payload;
 }
 
-function resolveProviderImageInput(userId, value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => resolveProviderImageInput(userId, item));
-  }
-  const raw = String(value || "").trim();
-  if (!raw.startsWith("/api/assets/")) return raw;
-
-  const assetId = raw.split("/api/assets/")[1]?.split(/[?#]/)[0];
-  if (!assetId) return raw;
-  const asset = statements.assetForUser.get(assetId, userId);
-  if (!asset?.file_path || !fs.existsSync(asset.file_path)) return raw;
-
-  const ext = path.extname(asset.file_path).toLowerCase();
-  const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
-  const base64 = fs.readFileSync(asset.file_path).toString("base64");
-  return `data:${mime};base64,${base64}`;
+function headerFirstValue(value) {
+  return String(value || "").split(",")[0].trim();
 }
 
-function resolveProviderImageInputs(userId, payload) {
+function requestPublicBaseUrl(req) {
+  const configured = String(process.env.PUBLIC_BASE_URL || process.env.APP_PUBLIC_URL || "").trim().replace(/\/+$/, "");
+  if (configured) return configured;
+  const protocol = headerFirstValue(req?.get?.("x-forwarded-proto")) || req?.protocol || "http";
+  const host = headerFirstValue(req?.get?.("x-forwarded-host")) || headerFirstValue(req?.get?.("host"));
+  return host ? `${protocol}://${host}` : "";
+}
+
+function assetApiPath(assetOrId) {
+  const assetId = typeof assetOrId === "string" ? assetOrId : assetOrId?.id;
+  return assetId ? `/api/assets/${encodeURIComponent(assetId)}` : "";
+}
+
+function assetPublicPath(assetOrId) {
+  const asset = typeof assetOrId === "object" ? assetOrId : null;
+  const assetId = typeof assetOrId === "string" ? assetOrId : asset?.id;
+  if (!assetId) return "";
+  const ext = [".png", ".jpg", ".jpeg", ".webp"].includes(path.extname(asset?.file_path || "").toLowerCase())
+    ? path.extname(asset.file_path).toLowerCase()
+    : "";
+  return `/public/assets/${encodeURIComponent(assetId)}${ext}`;
+}
+
+function assetPublicUrl(assetOrId, req) {
+  const lookupId = typeof assetOrId === "string" ? assetOrId : "";
+  const asset = typeof assetOrId === "object" ? assetOrId : lookupId ? statements.assetById.get(lookupId) : null;
+  const existingUrl = String(asset?.url || "").trim();
+  if (/^https?:\/\//i.test(existingUrl) && !assetIdFromLocalAssetUrl(existingUrl, req)) return existingUrl;
+
+  const publicPath = assetPublicPath(asset || assetOrId);
+  if (!publicPath) return "";
+  const baseUrl = requestPublicBaseUrl(req);
+  return baseUrl ? `${baseUrl}${publicPath}` : publicPath;
+}
+
+function localAssetIdFromPathname(pathname) {
+  const match = String(pathname || "").match(/^\/(?:api\/assets|public\/assets)\/(asset_[a-f0-9]{20})(?:\.[A-Za-z0-9]+)?(?:[/?#]|$)/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function assetIdFromRouteValue(value) {
+  const decoded = decodeURIComponent(String(value || ""));
+  const match = decoded.match(/^(asset_[a-f0-9]{20})(?:\.[A-Za-z0-9]+)?$/);
+  return match ? match[1] : decoded;
+}
+
+function assetIdFromLocalAssetUrl(value, req) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (raw.startsWith("/")) return localAssetIdFromPathname(raw);
+
+  try {
+    const parsed = new URL(raw);
+    const baseUrl = requestPublicBaseUrl(req);
+    if (!baseUrl) return "";
+    const parsedBase = new URL(baseUrl);
+    if (parsed.origin !== parsedBase.origin) return "";
+    return localAssetIdFromPathname(parsed.pathname);
+  } catch {
+    return "";
+  }
+}
+
+async function resolveProviderImageInput(userId, value, req, cache = new Map()) {
+  if (Array.isArray(value)) {
+    return Promise.all(value.map((item) => resolveProviderImageInput(userId, item, req, cache)));
+  }
+  const raw = String(value || "").trim();
+  if (!raw) return raw;
+
+  if (cache.has(raw)) {
+    return cache.get(raw);
+  }
+
+  const resolved = (async () => {
+    const validated = await validateImageUrlForGeneration(raw, req);
+    const finalUrl = validated.url || raw;
+    if (assetIdFromLocalAssetUrl(raw, req)) {
+      const normalized = normalizeExternalImageUrl(finalUrl);
+      await assertPublicImageUrlTarget(normalized);
+      return normalized;
+    }
+    return finalUrl;
+  })();
+  cache.set(raw, resolved);
+  return resolved;
+}
+
+async function resolveProviderImageInputs(userId, payload, req) {
+  const cache = new Map();
   if (payload.image) {
-    payload.image = resolveProviderImageInput(userId, payload.image);
+    payload.image = await resolveProviderImageInput(userId, payload.image, req, cache);
   }
   if (payload.image_urls) {
-    payload.image_urls = resolveProviderImageInput(userId, payload.image_urls);
+    payload.image_urls = await resolveProviderImageInput(userId, payload.image_urls, req, cache);
+  }
+  if (payload.metadata) {
+    for (const key of ["first_frame_url", "last_frame_url", "reference_image_url"]) {
+      if (payload.metadata[key]) {
+        payload.metadata[key] = await resolveProviderImageInput(userId, payload.metadata[key], req, cache);
+      }
+    }
   }
   return payload;
 }
 
-async function callProvider(userId, method, pathname, payload) {
+async function callProvider(userId, method, pathname, payload, options = {}) {
   const keyRecord = statements.apiKeyForUser.get(userId);
   if (!keyRecord) {
     const error = new Error("请先配置 API key。");
@@ -1425,16 +1523,30 @@ async function callProvider(userId, method, pathname, payload) {
     upstreamRequest: {
       method,
       url: upstreamUrl,
-      headers: safeJson(headers),
+      headers: safeJson({ ...headers, Authorization: "Bearer <redacted>" }),
       body: safeJson(payload ?? null),
     },
   };
 
-  const response = await fetch(upstreamUrl, {
-    method,
-    headers,
-    body: payload ? JSON.stringify(payload) : undefined,
-  });
+  const controller = options.timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), options.timeoutMs) : null;
+  let response;
+  try {
+    response = await fetch(upstreamUrl, {
+      method,
+      headers,
+      body: payload ? JSON.stringify(payload) : undefined,
+      signal: controller?.signal,
+    });
+  } catch (fetchError) {
+    const error = new Error(fetchError?.name === "AbortError" ? "上游接口测试超时，请稍后重试。" : fetchError.message);
+    error.statusCode = fetchError?.name === "AbortError" ? 504 : 500;
+    error.code = fetchError?.name === "AbortError" ? "PROVIDER_TIMEOUT" : "PROVIDER_NETWORK_ERROR";
+    error.debug = debug;
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   const rawText = await response.text();
   let body;
   try {
@@ -1474,7 +1586,7 @@ function createImageAsset({ userId, projectId, type, source, filePath, metadata 
     userId,
     type,
     source,
-    `/api/assets/${assetId}`,
+    assetPublicPath(assetId),
     assetPath,
     jsonStringify(metadata),
   );
@@ -1785,6 +1897,27 @@ function taskCenterResponse(row) {
   };
 }
 
+function normalizeProviderModels(body) {
+  const source = Array.isArray(body?.data)
+    ? body.data
+    : Array.isArray(body?.models)
+      ? body.models
+      : Array.isArray(body)
+        ? body
+        : [];
+  return source
+    .map((item) => {
+      if (typeof item === "string") return item;
+      return item?.id || item?.model || item?.name || "";
+    })
+    .map((item) => String(item).trim())
+    .filter(Boolean);
+}
+
+function findSeedanceModels(models) {
+  return models.filter((model) => /seedance/i.test(model));
+}
+
 function ensureUtilityProject(userId, name = "API key 测试") {
   const existing = db.prepare("SELECT * FROM projects WHERE user_id = ? AND name = ? ORDER BY created_at ASC LIMIT 1").get(userId, name);
   if (existing) return existing;
@@ -1793,47 +1926,143 @@ function ensureUtilityProject(userId, name = "API key 测试") {
   return statements.projectById.get(projectId, userId);
 }
 
-function assetResponse(asset) {
+function assetResponse(asset, req = null) {
   if (!asset) return null;
+  const publicUrl = assetPublicUrl(asset, req);
+  const apiUrl = assetApiPath(asset);
   return {
     id: asset.id,
     projectId: asset.project_id,
     type: asset.type,
     source: asset.source,
-    url: asset.url || `/api/assets/${asset.id}`,
+    url: publicUrl || asset.url || apiUrl,
+    publicUrl,
+    apiUrl,
     metadata: jsonParse(asset.metadata_json, {}),
     createdAt: asset.created_at,
   };
 }
 
+function uploadImageError(message, statusCode = 400, code = "IMAGE_UPLOAD_INVALID") {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
+function formatByteSize(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  return `${Math.round((bytes / 1024 / 1024) * 10) / 10}MB`;
+}
+
+function uploadImageMessage(reason = "") {
+  const suffix = reason ? `当前文件${reason}。` : "";
+  return `图片上传失败：${suffix}请上传 ${imageUploadMaxLabel} 以内的 PNG、JPG 或 WebP 图片；如果图片较大，建议先压缩或转成 WebP。`;
+}
+
+function normalizeImageMime(mime) {
+  const normalized = String(mime || "").split(";")[0].trim().toLowerCase();
+  return normalized === "image/jpg" ? "image/jpeg" : normalized;
+}
+
+function imageMimeFromFileName(fileName) {
+  const ext = path.extname(String(fileName || "")).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  return "";
+}
+
+function imageMimeFromUrlOrFileName(value) {
+  try {
+    return imageMimeFromFileName(new URL(String(value || "")).pathname);
+  } catch {
+    return imageMimeFromFileName(value);
+  }
+}
+
+function imageMimeFromBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return "";
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  return "";
+}
+
+function imageExtensionFromMime(mime) {
+  if (mime === "image/png") return ".png";
+  if (mime === "image/webp") return ".webp";
+  if (mime === "image/jpeg") return ".jpg";
+  return "";
+}
+
+function supportedImageMimeFromHeaderOrUrl(contentType, url) {
+  const headerMime = normalizeImageMime(contentType);
+  if (imageExtensionFromMime(headerMime)) return headerMime;
+  if (!headerMime || ["application/octet-stream", "binary/octet-stream"].includes(headerMime)) {
+    return imageMimeFromUrlOrFileName(url);
+  }
+  return headerMime;
+}
+
+function imageUploadFileName(req) {
+  const headerValue = String(req.get("X-File-Name") || req.body?.fileName || "upload");
+  try {
+    return decodeURIComponent(headerValue).slice(0, 180);
+  } catch {
+    return headerValue.slice(0, 180);
+  }
+}
+
 function parseImageDataUrl(dataUrl) {
   const match = String(dataUrl || "").match(/^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/);
   if (!match) return null;
-  const mime = match[1] === "image/jpg" ? "image/jpeg" : match[1];
-  const extension = mime === "image/png" ? ".png" : mime === "image/webp" ? ".webp" : ".jpg";
+  const mime = normalizeImageMime(match[1]);
+  const extension = imageExtensionFromMime(mime);
   const buffer = Buffer.from(match[2], "base64");
-  if (!buffer.length || buffer.length > 12 * 1024 * 1024) return null;
+  if (!extension || !buffer.length || buffer.length > imageUploadMaxBytes) return null;
   return { mime, extension, buffer };
 }
 
-function saveUploadedImageAsset({ userId, projectId, dataUrl, fileName, type = "reference_image" }) {
-  const parsed = parseImageDataUrl(dataUrl);
-  if (!parsed) {
-    const error = new Error("请上传 12MB 以内的 PNG、JPG 或 WebP 图片。");
-    error.statusCode = 400;
-    throw error;
+function saveUploadedImageAssetBuffer({ userId, projectId, buffer, mime, fileName, type = "reference_image" }) {
+  if (!Buffer.isBuffer(buffer) || !buffer.length) {
+    throw uploadImageError(uploadImageMessage("为空"));
+  }
+  if (buffer.length > imageUploadMaxBytes) {
+    throw uploadImageError(uploadImageMessage(`大小为 ${Math.round((buffer.length / 1024 / 1024) * 10) / 10}MB，超过 ${imageUploadMaxLabel}`), 413, "IMAGE_UPLOAD_TOO_LARGE");
+  }
+  const detectedMime = imageMimeFromBuffer(buffer);
+  const normalizedMime = detectedMime || normalizeImageMime(mime) || imageMimeFromFileName(fileName);
+  const extension = imageExtensionFromMime(normalizedMime);
+  if (!detectedMime || !extension) {
+    throw uploadImageError(uploadImageMessage("内容不是有效的 PNG、JPG 或 WebP 图片"));
   }
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cvc-upload-"));
-  const tempPath = path.join(tempRoot, `upload${parsed.extension}`);
+  const tempPath = path.join(tempRoot, `upload${extension}`);
   try {
-    fs.writeFileSync(tempPath, parsed.buffer);
+    fs.writeFileSync(tempPath, buffer);
     const assetId = createImageAsset({
       userId,
       projectId,
       type,
       source: "upload",
       filePath: tempPath,
-      metadata: { fileName: String(fileName || "upload").slice(0, 180), mime: parsed.mime },
+      metadata: { fileName: String(fileName || "upload").slice(0, 180), mime: normalizedMime },
     });
     return statements.assetForUser.get(assetId, userId);
   } finally {
@@ -1841,9 +2070,303 @@ function saveUploadedImageAsset({ userId, projectId, dataUrl, fileName, type = "
   }
 }
 
+function saveUploadedImageAsset({ userId, projectId, dataUrl, fileName, type = "reference_image" }) {
+  const parsed = parseImageDataUrl(dataUrl);
+  if (!parsed) {
+    throw uploadImageError(uploadImageMessage());
+  }
+  return saveUploadedImageAssetBuffer({
+    userId,
+    projectId,
+    buffer: parsed.buffer,
+    mime: parsed.mime,
+    fileName,
+    type,
+  });
+}
+
+function saveUploadedImageAssetFromRequest(req, { userId, projectId }) {
+  const type = String(req.query.type || req.get("X-Asset-Type") || req.body?.type || "reference_image").trim() || "reference_image";
+  const fileName = imageUploadFileName(req);
+  if (Buffer.isBuffer(req.body)) {
+    return saveUploadedImageAssetBuffer({
+      userId,
+      projectId,
+      buffer: req.body,
+      mime: req.get("Content-Type") || imageMimeFromFileName(fileName),
+      fileName,
+      type,
+    });
+  }
+  return saveUploadedImageAsset({
+    userId,
+    projectId,
+    dataUrl: req.body?.dataUrl,
+    fileName,
+    type,
+  });
+}
+
+function isBlockedImageUrlHostname(hostname) {
+  const lower = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!lower || lower === "localhost" || lower.endsWith(".localhost") || lower.endsWith(".local")) return true;
+  const ipVersion = net.isIP(lower);
+  if (ipVersion === 4) {
+    const parts = lower.split(".").map((part) => Number(part));
+    return (
+      parts[0] === 0 ||
+      parts[0] === 10 ||
+      parts[0] === 127 ||
+      parts[0] === 169 && parts[1] === 254 ||
+      parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31 ||
+      parts[0] === 192 && parts[1] === 168
+    );
+  }
+  if (ipVersion === 6) {
+    if (lower.startsWith("::ffff:")) return isBlockedImageUrlHostname(lower.slice("::ffff:".length));
+    return lower === "::" || lower === "::1" || lower.startsWith("fc") || lower.startsWith("fd") || lower.startsWith("fe80:");
+  }
+  return false;
+}
+
+async function assertPublicImageUrlTarget(url) {
+  const parsed = new URL(url);
+  if (isBlockedImageUrlHostname(parsed.hostname)) {
+    throw uploadImageError("这个图片 URL 指向本地或内网地址，生成服务无法访问。请使用公网可访问的图片 URL。", 400, "IMAGE_URL_PRIVATE");
+  }
+  if (net.isIP(parsed.hostname)) return;
+  let addresses = [];
+  try {
+    addresses = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
+  } catch {
+    throw uploadImageError("图片 URL 的域名无法解析，请确认地址拼写正确。", 400, "IMAGE_URL_DNS_FAILED");
+  }
+  if (!addresses.length || addresses.some((item) => isBlockedImageUrlHostname(item.address))) {
+    throw uploadImageError("这个图片 URL 解析到了内网地址，生成服务无法访问。请使用公网可访问的图片 URL。", 400, "IMAGE_URL_PRIVATE");
+  }
+}
+
+async function assertPublicDownloadUrlTarget(url) {
+  const parsed = new URL(url);
+  if (isBlockedImageUrlHostname(parsed.hostname)) {
+    const error = new Error("视频下载地址指向本地或内网地址，已被拦截。");
+    error.statusCode = 400;
+    error.code = "VIDEO_URL_PRIVATE";
+    throw error;
+  }
+  if (net.isIP(parsed.hostname)) return;
+  let addresses = [];
+  try {
+    addresses = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
+  } catch {
+    const error = new Error("视频下载地址的域名无法解析。");
+    error.statusCode = 400;
+    error.code = "VIDEO_URL_DNS_FAILED";
+    throw error;
+  }
+  if (!addresses.length || addresses.some((item) => isBlockedImageUrlHostname(item.address))) {
+    const error = new Error("视频下载地址解析到了内网地址，已被拦截。");
+    error.statusCode = 400;
+    error.code = "VIDEO_URL_PRIVATE";
+    throw error;
+  }
+}
+
+function normalizeExternalImageUrl(value, options = {}) {
+  let parsed;
+  try {
+    parsed = new URL(String(value || "").trim());
+  } catch {
+    throw uploadImageError("图片 URL 格式不正确，请粘贴以 http:// 或 https:// 开头的完整图片地址。", 400, "IMAGE_URL_INVALID");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw uploadImageError("图片 URL 只支持 http:// 或 https:// 地址。", 400, "IMAGE_URL_INVALID");
+  }
+  if (!options.skipPrivateCheck && isBlockedImageUrlHostname(parsed.hostname)) {
+    throw uploadImageError("这个图片 URL 指向本地或内网地址，生成服务无法访问。请使用公网可访问的图片 URL。", 400, "IMAGE_URL_PRIVATE");
+  }
+  return parsed.toString();
+}
+
+function normalizeExternalDownloadUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(String(value || "").trim());
+  } catch {
+    const error = new Error("视频下载地址格式不正确。");
+    error.statusCode = 400;
+    error.code = "VIDEO_URL_INVALID";
+    throw error;
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    const error = new Error("视频下载地址只支持 http:// 或 https://。");
+    error.statusCode = 400;
+    error.code = "VIDEO_URL_INVALID";
+    throw error;
+  }
+  if (isBlockedImageUrlHostname(parsed.hostname)) {
+    const error = new Error("视频下载地址指向本地或内网地址，已被拦截。");
+    error.statusCode = 400;
+    error.code = "VIDEO_URL_PRIVATE";
+    throw error;
+  }
+  return parsed.toString();
+}
+
+async function probeImageUrl(url, { method = "HEAD", timeoutMs = 8000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method,
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        Accept: "image/png,image/jpeg,image/webp;q=0.9,*/*;q=0.2",
+        "User-Agent": "ContinuousVideoCanvas/1.0 image-url-validator",
+        ...(method === "GET" ? { Range: "bytes=0-0" } : {}),
+      },
+    });
+    await response.body?.cancel?.();
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function validateImageUrlForGeneration(value, req) {
+  const localAssetId = assetIdFromLocalAssetUrl(value, req);
+  if (localAssetId) {
+    const asset = statements.assetForUser.get(localAssetId, req.user.id);
+    if (!asset?.file_path || !fs.existsSync(asset.file_path)) {
+      throw uploadImageError("这张本地图片已经不存在或被清理，请重新上传。", 404, "IMAGE_URL_NOT_FOUND");
+    }
+    const mime = imageMimeFromFileName(asset.file_path);
+    return {
+      ok: true,
+      url: assetPublicUrl(asset, req),
+      contentType: mime,
+      sizeBytes: fs.statSync(asset.file_path).size,
+      sizeLabel: formatByteSize(fs.statSync(asset.file_path).size),
+      message: "图片 URL 可用。",
+    };
+  }
+
+  const url = normalizeExternalImageUrl(value);
+  await assertPublicImageUrlTarget(url);
+  let response;
+  try {
+    response = await probeImageUrl(url, { method: "HEAD" });
+    if ([405, 403].includes(response.status)) {
+      response = await probeImageUrl(url, { method: "GET" });
+    }
+  } catch (error) {
+    const message = error?.name === "AbortError"
+      ? "图片 URL 验证超时，请确认图片地址能公开访问。"
+      : "图片 URL 无法访问，请确认地址没有过期，也不需要登录或防盗链授权。";
+    throw uploadImageError(message, 400, "IMAGE_URL_UNREACHABLE");
+  }
+
+  if (!response.ok && response.status !== 206) {
+    throw uploadImageError(`图片 URL 无法访问，服务器返回 HTTP ${response.status}。请确认图片不是私有链接、登录后才能查看，或已开启防盗链。`, 400, "IMAGE_URL_UNREACHABLE");
+  }
+
+  const finalUrl = response.url || url;
+  normalizeExternalImageUrl(finalUrl);
+  await assertPublicImageUrlTarget(finalUrl);
+  const contentType = supportedImageMimeFromHeaderOrUrl(response.headers.get("content-type"), finalUrl);
+  const extension = imageExtensionFromMime(contentType);
+  if (!extension) {
+    throw uploadImageError("这个 URL 可以访问，但返回的不是 PNG、JPG 或 WebP 图片。请换一个直接指向图片文件的地址。", 400, "IMAGE_URL_NOT_IMAGE");
+  }
+
+  const contentLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(contentLength) && contentLength > imageUploadMaxBytes) {
+    throw uploadImageError(`图片 URL 可访问，但图片大小约 ${formatByteSize(contentLength)}，超过 ${imageUploadMaxLabel}。请压缩后重新上传或换一个较小的图片 URL。`, 413, "IMAGE_URL_TOO_LARGE");
+  }
+
+  return {
+    ok: true,
+    url: finalUrl,
+    contentType,
+    sizeBytes: Number.isFinite(contentLength) ? contentLength : null,
+    sizeLabel: Number.isFinite(contentLength) ? formatByteSize(contentLength) : "",
+    message: Number.isFinite(contentLength) ? "图片 URL 可用。" : "图片 URL 可用，但服务器没有返回文件大小。",
+  };
+}
+
+function sqliteDateTime(date) {
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function collectAssetIds(value, output) {
+  const text = String(value || "");
+  for (const match of text.matchAll(/\basset_[a-f0-9]{20}\b/g)) {
+    output.add(match[0]);
+  }
+}
+
+function collectReferencedAssetIds() {
+  const referenced = new Set();
+  for (const row of statements.taskAssetReferences.all()) {
+    if (row.first_frame_asset_id) referenced.add(row.first_frame_asset_id);
+    if (row.last_frame_asset_id) referenced.add(row.last_frame_asset_id);
+  }
+
+  for (const table of [
+    ["canvas_nodes", "data_json"],
+    ["creation_plans", "plan_json"],
+    ["creation_messages", "content_json"],
+  ]) {
+    const rows = db.prepare(`SELECT ${table[1]} AS json_text FROM ${table[0]}`).all();
+    for (const row of rows) collectAssetIds(row.json_text, referenced);
+  }
+  return referenced;
+}
+
+function isPathInside(parentDir, childPath) {
+  if (!childPath) return false;
+  const parent = path.resolve(parentDir);
+  const child = path.resolve(childPath);
+  return child === parent || child.startsWith(`${parent}${path.sep}`);
+}
+
+function cleanupImageAssets({ now = new Date() } = {}) {
+  const cutoff = sqliteDateTime(new Date(now.getTime() - imageAssetCleanupRetentionMs));
+  const referenced = collectReferencedAssetIds();
+  const candidates = statements.assetsBefore.all(cutoff);
+  let deleted = 0;
+  let skipped = 0;
+
+  for (const asset of candidates) {
+    if (referenced.has(asset.id)) {
+      skipped += 1;
+      continue;
+    }
+
+    if (asset.file_path && isPathInside(assetDir, asset.file_path) && fs.existsSync(asset.file_path)) {
+      fs.rmSync(asset.file_path, { force: true });
+    }
+    statements.deleteAsset.run(asset.id);
+    deleted += 1;
+  }
+
+  if (deleted || skipped) {
+    console.log(`Image asset cleanup complete: deleted=${deleted}, keptReferenced=${skipped}, cutoff=${cutoff}`);
+  }
+  return { deleted, skipped, cutoff };
+}
+
+function scheduleImageAssetCleanup() {
+  cleanupImageAssets();
+  const timer = setInterval(() => cleanupImageAssets(), imageAssetCleanupIntervalMs);
+  timer.unref?.();
+}
+
 ensureAdminAccount();
 backfillRequestLogs();
 statements.cleanupSessions.run();
+scheduleImageAssetCleanup();
 
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -2451,7 +2974,7 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
       motionStrength: plan.motionStrength || "medium",
     });
     payload = buildGenerationPayload(shotData);
-    payload = resolveProviderImageInputs(req.user.id, payload);
+    payload = await resolveProviderImageInputs(req.user.id, payload, req);
 
     const linkedProject = session.linked_project_id
       ? statements.projectById.get(session.linked_project_id, req.user.id)
@@ -2571,7 +3094,7 @@ app.post("/api/creation-sessions/:sessionId/continue", requireAuth, (req, res) =
     return;
   }
   const useLastFrame = req.body.useLastFrame !== false;
-  const lastFrameUrl = useLastFrame && last.last_frame_asset_id ? `/api/assets/${last.last_frame_asset_id}` : "";
+  const lastFrameUrl = useLastFrame && last.last_frame_asset_id ? assetPublicUrl(last.last_frame_asset_id, req) : "";
   const referenceImageUrl = String(req.body.referenceImageUrl || "").trim();
   const plan = parsePlannerInput(req.body.text || "延续上一镜头，继续描述下一段动作...", {
     referenceImageUrl,
@@ -2600,131 +3123,52 @@ app.post("/api/creation-sessions/:sessionId/send-to-canvas", requireAuth, (req, 
 });
 
 app.post("/api/me/api-key/test", requireAuth, async (req, res) => {
-  const payload = {
-    model: defaultModel,
-    prompt: "Connectivity test: a clean five second shot of soft light moving across a glass creative desk, no text, no logo.",
-    duration: 5,
-    width: 1280,
-    height: 720,
-    n: 1,
-    metadata: { ratio: "16:9", resolution: "720p", watermark: false },
-  };
-
-  const project = ensureUtilityProject(req.user.id);
-  const sourceNodeId = id("shot");
-  const resultNodeId = id("render");
-  const taskIdValue = id("task");
-  const baseX = 80 + Math.floor(Math.random() * 80);
-  const shotData = defaultShotData({
-    title: "API key 测试",
-    prompt: payload.prompt,
-    duration: payload.duration,
-    ratio: "16:9",
-    resolution: "720p",
-    model: payload.model,
-  });
-  db.transaction(() => {
-    saveNode(project.id, { id: sourceNodeId, type: "shot", position: { x: baseX, y: 80 }, data: shotData });
-    saveNode(project.id, {
-      id: resultNodeId,
-      type: "render",
-      position: { x: baseX + 420, y: 80 },
-      data: {
-        title: "API key 测试结果",
-        status: "queued",
-        progress: 0,
-        taskId: taskIdValue,
-        sourceNodeId,
-        upstreamTaskId: "",
-        videoUrl: "",
-        resultUrl: "",
-        error: "",
-      },
-    });
-    saveEdge(project.id, { id: id("edge"), source: sourceNodeId, target: resultNodeId, kind: "render", data: { kind: "render" } });
-    statements.createTask.run(
-      taskIdValue,
-      project.id,
-      req.user.id,
-      sourceNodeId,
-      resultNodeId,
-      "queued",
-      0,
-      jsonStringify(safeJson(payload)),
-      jsonStringify({ localRequest: { method: "POST", url: "/api/me/api-key/test", body: safeJson(payload) } }),
-    );
-    statements.updateTaskSource.run("test", taskIdValue);
-  })();
-  recordRequestLog(req, {
-    action: "api_key_test_created",
-    projectId: project.id,
-    taskId: taskIdValue,
-    nodeId: resultNodeId,
-    sourceNodeId,
-    status: "queued",
-    message: "API key 测试任务已创建",
-  });
-
   try {
-    const { body, debug } = await callProvider(req.user.id, "POST", "/v1/video/generations", payload);
-    const normalized = normalizeTask(body);
-    statements.updateTaskSubmitted.run(
-      normalized.upstreamTaskId || "",
-      normalized.status,
-      normalized.progress ?? 0,
-      jsonStringify(safeJson(body)),
-      jsonStringify(debug),
-      taskIdValue,
-    );
-    updateRenderNode(project.id, resultNodeId, {
-      status: normalized.status,
-      progress: normalized.progress ?? 0,
-      upstreamTaskId: normalized.upstreamTaskId || "",
-      videoUrl: normalized.videoUrl || "",
-      resultUrl: normalized.resultUrl || "",
-    });
+    const { body, debug } = await callProvider(req.user.id, "GET", "/v1/models", null, { timeoutMs: 10000 });
+    const models = normalizeProviderModels(body);
+    const seedanceModels = findSeedanceModels(models);
+    const hasDefaultModel = models.includes(defaultModel);
+    const hasSeedanceModel = hasDefaultModel || seedanceModels.length > 0;
+
     recordRequestLog(req, {
-      action: "api_key_test_submitted",
-      projectId: project.id,
-      taskId: taskIdValue,
-      nodeId: resultNodeId,
-      sourceNodeId,
-      providerTaskId: normalized.upstreamTaskId,
-      status: normalized.status,
-      message: "API key 测试上游任务已提交",
+      action: "api_key_lightweight_test",
+      status: hasSeedanceModel ? "ok" : "model_missing",
+      message: hasSeedanceModel ? "API key 轻量测试通过" : "API key 可用，但模型列表未包含 Seedance",
+      hasError: !hasSeedanceModel,
     });
-    res.json({ ok: true, ...normalized, task: taskResponse(statements.taskById.get(taskIdValue)), projectId: project.id, resultNodeId, sourceNodeId, debug });
+
+    if (!hasSeedanceModel) {
+      res.status(400).json({
+        error: {
+          message: "API key 可连接，但当前 bobAPI 分组没有 Seedance 模型。请切换到包含 Seedance 的分组，例如 banana Pro 官转。",
+          code: "SEEDANCE_MODEL_MISSING",
+          requestId: req.requestId,
+          modelsChecked: models.slice(0, 30),
+        },
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      mode: "models",
+      message: hasDefaultModel ? `API key 可用，已检测到 ${defaultModel}。` : "API key 可用，已检测到 Seedance 模型。",
+      model: defaultModel,
+      matchedModels: hasDefaultModel ? [defaultModel] : seedanceModels.slice(0, 10),
+      debug,
+    });
   } catch (error) {
-    statements.updateTaskError.run(
-      jsonStringify({ message: error.message, upstream: error.upstream }),
-      jsonStringify(error.debug || {}),
-      taskIdValue,
-    );
     const logged = createErrorEvent(req, error, {
       source: "provider",
       code: error.code || "PROVIDER_HTTP_ERROR",
-      projectId: project.id,
-      taskId: taskIdValue,
-      nodeId: resultNodeId,
-      request: { body: payload },
+      request: { method: "GET", path: "/v1/models" },
       response: { message: error.message, upstream: error.upstream },
       debug: error.debug,
       statusCode: error.statusCode || 500,
     });
-    updateRenderNode(project.id, resultNodeId, {
-      status: "failed",
-      error: error.message,
-      errorCode: logged.code,
-      requestId: logged.requestId,
-      eventId: logged.eventId,
-    });
     recordRequestLog(req, {
-      action: "api_key_test_failed",
-      projectId: project.id,
-      taskId: taskIdValue,
-      nodeId: resultNodeId,
-      sourceNodeId,
-      status: "failed",
+      action: "api_key_lightweight_test_failed",
+      status: logged.code,
       message: error.message,
       hasError: true,
       eventId: logged.eventId,
@@ -2735,10 +3179,9 @@ app.post("/api/me/api-key/test", requireAuth, async (req, res) => {
         code: logged.code,
         requestId: logged.requestId,
         eventId: logged.eventId,
-        taskId: taskIdValue,
         upstream: error.upstream,
         debug: error.debug || {
-          localRequest: { method: "POST", url: "/api/me/api-key/test", body: safeJson(payload) },
+          localRequest: { method: "GET", url: "/v1/models" },
         },
       },
     });
@@ -2850,7 +3293,7 @@ app.post("/api/projects/:projectId/nodes/:nodeId/generate", requireAuth, require
   const sourceData = { ...jsonParse(sourceNode.data_json, {}), ...(req.body.data || {}) };
   try {
     payload = buildGenerationPayload(sourceData);
-    payload = resolveProviderImageInputs(req.user.id, payload);
+    payload = await resolveProviderImageInputs(req.user.id, payload, req);
   } catch (error) {
     res.status(error.statusCode || 400).json({ error: { message: error.message } });
     return;
@@ -3028,7 +3471,7 @@ app.post("/api/projects/:projectId/render-nodes/:nodeId/continue", requireAuth, 
   const sourceData = sourceNode ? jsonParse(sourceNode.data_json, {}) : {};
   const useLastFrame = req.body.useLastFrame !== false;
   const firstFrameAssetId = useLastFrame ? task?.last_frame_asset_id || "" : "";
-  const firstFrameUrl = firstFrameAssetId ? `/api/assets/${firstFrameAssetId}` : "";
+  const firstFrameUrl = firstFrameAssetId ? assetPublicUrl(firstFrameAssetId, req) : "";
   const uploadedReferenceUrl = String(req.body.referenceImageUrl || "").trim();
   const nextShotId = id("shot");
   const edgeId = id("edge");
@@ -3179,6 +3622,54 @@ app.get("/api/tasks/:taskId/debug", requireAuth, (req, res) => {
   });
 });
 
+app.get("/api/tasks/:taskId/download", requireAuth, async (req, res, next) => {
+  try {
+    const lookupId = String(req.params.taskId || "").trim();
+    const task = req.user.isAdmin
+      ? statements.taskById.get(lookupId)
+      : statements.taskForUser.get(lookupId, req.user.id);
+    if (!task) {
+      res.status(404).json({ error: { message: "任务不存在。" } });
+      return;
+    }
+    const videoUrl = normalizeExternalDownloadUrl(task.video_url || "");
+    await assertPublicDownloadUrlTarget(videoUrl);
+    const upstream = await fetch(videoUrl, {
+      headers: {
+        Accept: "video/mp4,video/*;q=0.9,*/*;q=0.2",
+        "User-Agent": "ContinuousVideoCanvas/1.0 video-downloader",
+      },
+      redirect: "follow",
+    });
+    if (!upstream.ok || !upstream.body) {
+      res.status(upstream.status || 502).json({ error: { message: `视频下载失败：上游返回 HTTP ${upstream.status || 502}。` } });
+      return;
+    }
+
+    const extension = path.extname(new URL(upstream.url || videoUrl).pathname).toLowerCase() || ".mp4";
+    const safeExtension = [".mp4", ".mov", ".webm"].includes(extension) ? extension : ".mp4";
+    const fileName = `${task.id}${safeExtension}`;
+    res.setHeader("Content-Type", upstream.headers.get("content-type") || "video/mp4");
+    const contentLength = upstream.headers.get("content-length");
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+    res.setHeader("Cache-Control", "private, no-store");
+    Readable.fromWeb(upstream.body).on("error", next).pipe(res);
+  } catch (error) {
+    if (res.headersSent) {
+      next(error);
+      return;
+    }
+    res.status(error.statusCode || 500).json({
+      error: {
+        message: error.message || "视频下载失败。",
+        code: error.code || "VIDEO_DOWNLOAD_FAILED",
+        requestId: req.requestId,
+      },
+    });
+  }
+});
+
 app.get("/api/tasks/:taskId/logs", requireAuth, (req, res) => {
   const task = statements.taskForUser.get(req.params.taskId, req.user.id);
   if (!task) {
@@ -3189,9 +3680,41 @@ app.get("/api/tasks/:taskId/logs", requireAuth, (req, res) => {
   res.json({ task: taskResponse(task), events });
 });
 
-app.post("/api/assets/upload", requireAuth, (req, res) => {
+const imageUploadRawParser = express.raw({
+  type: ["image/png", "image/jpeg", "image/jpg", "image/webp", "application/octet-stream"],
+  limit: imageUploadMaxBytes,
+});
+
+function parseImageUploadBody(req, res, next) {
+  if (req.is("application/json")) {
+    next();
+    return;
+  }
+  imageUploadRawParser(req, res, next);
+}
+
+app.post("/api/assets/validate-url", requireAuth, async (req, res) => {
   try {
-    const requestedProjectId = String(req.body.projectId || "").trim();
+    const imageUrl = String(req.body?.url || req.body?.imageUrl || "").trim();
+    if (!imageUrl) {
+      throw uploadImageError("请先粘贴图片 URL。", 400, "IMAGE_URL_REQUIRED");
+    }
+    const result = await validateImageUrlForGeneration(imageUrl, req);
+    res.json(result);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      error: {
+        message: error.message,
+        code: error.code || "IMAGE_URL_VALIDATE_FAILED",
+        requestId: req.requestId,
+      },
+    });
+  }
+});
+
+app.post("/api/assets/upload", requireAuth, parseImageUploadBody, (req, res) => {
+  try {
+    const requestedProjectId = String(req.query.projectId || req.get("X-Project-Id") || req.body?.projectId || "").trim();
     const project = requestedProjectId
       ? statements.projectById.get(requestedProjectId, req.user.id)
       : ensureUtilityProject(req.user.id, "上传参考图");
@@ -3199,32 +3722,38 @@ app.post("/api/assets/upload", requireAuth, (req, res) => {
       res.status(404).json({ error: { message: "项目不存在或无权访问。", code: "VALIDATION_ERROR", requestId: req.requestId } });
       return;
     }
-    const asset = saveUploadedImageAsset({
+    const asset = saveUploadedImageAssetFromRequest(req, {
       userId: req.user.id,
       projectId: project.id,
-      dataUrl: req.body.dataUrl,
-      fileName: req.body.fileName,
-      type: req.body.type || "reference_image",
     });
-    res.status(201).json({ asset: assetResponse(asset) });
+    res.status(201).json({ asset: assetResponse(asset, req) });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ error: { message: error.message, code: "ASSET_UPLOAD_FAILED", requestId: req.requestId } });
+    res.status(error.statusCode || 500).json({ error: { message: error.message, code: error.code || "ASSET_UPLOAD_FAILED", requestId: req.requestId } });
   }
 });
 
-app.post("/api/projects/:projectId/assets/upload", requireAuth, requireProject, (req, res) => {
+app.post("/api/projects/:projectId/assets/upload", requireAuth, requireProject, parseImageUploadBody, (req, res) => {
   try {
-    const asset = saveUploadedImageAsset({
+    const asset = saveUploadedImageAssetFromRequest(req, {
       userId: req.user.id,
       projectId: req.project.id,
-      dataUrl: req.body.dataUrl,
-      fileName: req.body.fileName,
-      type: req.body.type || "reference_image",
     });
-    res.status(201).json({ asset: assetResponse(asset) });
+    res.status(201).json({ asset: assetResponse(asset, req) });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ error: { message: error.message, code: "ASSET_UPLOAD_FAILED", requestId: req.requestId } });
+    res.status(error.statusCode || 500).json({ error: { message: error.message, code: error.code || "ASSET_UPLOAD_FAILED", requestId: req.requestId } });
   }
+});
+
+app.get("/public/assets/:assetId", (req, res) => {
+  const asset = statements.assetById.get(assetIdFromRouteValue(req.params.assetId));
+  if (!asset?.file_path || !isPathInside(assetDir, asset.file_path) || !fs.existsSync(asset.file_path)) {
+    res.status(404).json({ error: { message: "素材文件不存在。" } });
+    return;
+  }
+  res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  res.sendFile(asset.file_path);
 });
 
 app.get("/api/assets/:assetId", requireAuth, (req, res) => {
@@ -3323,6 +3852,40 @@ app.use(express.static(staticDir));
 
 app.get("*", (_req, res) => {
   sendVersionedHtml(res, path.join(staticDir, "index.html"));
+});
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+
+  if (error?.type === "entity.too.large" || error?.status === 413 || error?.statusCode === 413) {
+    const isImageUpload = /\/assets\/upload$/.test(req.path);
+    res.status(413).json({
+      error: {
+        message: isImageUpload
+          ? uploadImageMessage(`超过 ${imageUploadMaxLabel}`)
+          : "请求内容太大，服务器没有接收。请减少内容后重试。",
+        code: "UPLOAD_TOO_LARGE",
+        requestId: req.requestId,
+      },
+    });
+    return;
+  }
+
+  if (error instanceof SyntaxError && error.status === 400 && "body" in error) {
+    res.status(400).json({
+      error: {
+        message: "请求内容格式不正确，请刷新页面后重试。",
+        code: "INVALID_JSON_BODY",
+        requestId: req.requestId,
+      },
+    });
+    return;
+  }
+
+  next(error);
 });
 
 app.listen(port, () => {

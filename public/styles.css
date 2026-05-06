@@ -321,6 +321,53 @@ select:focus {
   background: var(--accent-strong);
 }
 
+.daily-notice-backdrop {
+  position: fixed;
+  z-index: 120;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(23, 32, 38, 0.48);
+  backdrop-filter: blur(8px);
+}
+
+.daily-notice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  width: min(720px, 100%);
+  padding: 18px;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(23, 32, 38, 0.96);
+  border-radius: 8px;
+  box-shadow: 0 28px 90px rgba(23, 32, 38, 0.28);
+}
+
+.daily-notice-icon {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  color: #fef3c7;
+  background: rgba(245, 158, 11, 0.2);
+  border-radius: 50%;
+  font-weight: 900;
+}
+
+.daily-notice strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.daily-notice p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.78);
+  line-height: 1.6;
+}
+
 .secondary-button {
   justify-self: center;
   border: 1px solid rgba(15, 118, 110, 0.28);
@@ -1083,6 +1130,14 @@ body {
 }
 
 @media (max-width: 720px) {
+  .daily-notice {
+    grid-template-columns: 1fr;
+  }
+
+  .daily-notice .primary-button {
+    width: 100%;
+  }
+
   .studio-shell {
     width: min(100% - 20px, 1440px);
     margin: 10px auto;

@@ -1,4 +1,44 @@
 const HISTORY_KEY = "seedanceStudioHistory";
+const IMAGE_UPLOAD_MAX_BYTES = 12 * 1024 * 1024;
+const IMAGE_UPLOAD_MAX_LABEL = "12MB";
+const IMAGE_UPLOAD_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+function localDateKey(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function showDailySiteNotice() {
+  const today = localDateKey();
+  try {
+    if (localStorage.getItem("cvc-daily-site-notice") === today) return;
+  } catch {
+    // Continue and show the notice when localStorage is unavailable.
+  }
+
+  const backdrop = document.createElement("div");
+  backdrop.className = "daily-notice-backdrop";
+  backdrop.innerHTML = `
+    <section class="daily-notice" role="dialog" aria-modal="true" aria-labelledby="dailyNoticeTitle">
+      <div class="daily-notice-icon">!</div>
+      <div>
+        <strong id="dailyNoticeTitle">测试站点提醒</strong>
+        <p>本站点只提供视频测试使用，图片和视频均会过期，请及时下载到本地。</p>
+      </div>
+      <button class="primary-button" type="button">我知道了</button>
+    </section>
+  `;
+  const close = () => {
+    try {
+      localStorage.setItem("cvc-daily-site-notice", today);
+    } catch {
+      // Closing should still work for this page view.
+    }
+    backdrop.remove();
+  };
+  backdrop.querySelector("button").addEventListener("click", close);
+  document.body.append(backdrop);
+}
 
 const templates = [
   {
@@ -42,7 +82,8 @@ const ratioDimensions = {
 
 const state = {
   mode: "text",
-  imageDataUrl: "",
+  imageAssetUrl: "",
+  imageUrlTimer: null,
   pollTimer: null,
   lastErrorDetail: null,
   history: [],
@@ -178,12 +219,72 @@ function openErrorModal() {
 async function readJson(response) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok || body.error) {
-    const message = body?.error?.message || `HTTP ${response.status}`;
+    const message = body?.error?.message || (response.status === 413 ? `图片太大，请压缩到 ${IMAGE_UPLOAD_MAX_LABEL} 以内后再上传。` : `HTTP ${response.status}`);
     const error = new Error(message);
     error.body = body;
     throw error;
   }
   return body;
+}
+
+function formatFileSize(bytes) {
+  return `${Math.round((bytes / 1024 / 1024) * 10) / 10}MB`;
+}
+
+function imageMimeFromFileName(fileName) {
+  const lower = String(fileName || "").toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return "";
+}
+
+function validateImageFile(file) {
+  const mime = file.type || imageMimeFromFileName(file.name);
+  if (!IMAGE_UPLOAD_TYPES.has(mime)) {
+    throw new Error("图片格式不支持，请上传 PNG、JPG 或 WebP 图片。");
+  }
+  if (file.size > IMAGE_UPLOAD_MAX_BYTES) {
+    throw new Error(`图片太大：当前 ${formatFileSize(file.size)}，请压缩到 ${IMAGE_UPLOAD_MAX_LABEL} 以内。`);
+  }
+  return mime;
+}
+
+function renderImagePreview(url, label = "图片预览") {
+  elements.imagePreview.innerHTML = "";
+  const image = document.createElement("img");
+  image.src = url;
+  image.alt = label;
+  elements.imagePreview.append(image);
+}
+
+async function uploadImageFile(file) {
+  const mime = validateImageFile(file);
+  const result = await readJson(
+    await fetch("/api/assets/upload?type=reference_image", {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": mime,
+        "X-File-Name": encodeURIComponent(file.name || "upload"),
+        "X-Asset-Type": "reference_image",
+      },
+      body: await file.arrayBuffer(),
+    }),
+  );
+  return result.asset?.publicUrl || result.asset?.url || "";
+}
+
+async function validateImageUrlInput(value) {
+  const result = await readJson(
+    await fetch("/api/assets/validate-url", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: value }),
+    }),
+  );
+  return result.url || value;
 }
 
 async function loadConfig() {
@@ -278,7 +379,7 @@ async function testConfiguredApi() {
 }
 
 function selectedImage() {
-  return elements.imageUrl.value.trim() || state.imageDataUrl;
+  return elements.imageUrl.value.trim() || state.imageAssetUrl;
 }
 
 function collectPayload() {
@@ -530,18 +631,50 @@ elements.duration.addEventListener("change", updateEstimate);
 
 elements.imageFile.addEventListener("change", () => {
   const file = elements.imageFile.files?.[0];
-  state.imageDataUrl = "";
+  state.imageAssetUrl = "";
   if (!file) {
     elements.imagePreview.textContent = "未选择图片";
     return;
   }
 
-  const reader = new FileReader();
-  reader.addEventListener("load", () => {
-    state.imageDataUrl = String(reader.result || "");
-    elements.imagePreview.innerHTML = `<img src="${state.imageDataUrl}" alt="图片预览" />`;
-  });
-  reader.readAsDataURL(file);
+  elements.imagePreview.textContent = "上传图片中...";
+  uploadImageFile(file)
+    .then((imageUrl) => {
+      state.imageAssetUrl = imageUrl;
+      elements.imageUrl.value = imageUrl;
+      renderImagePreview(imageUrl);
+    })
+    .catch((error) => {
+      elements.imagePreview.textContent = error.message;
+    });
+});
+
+elements.imageUrl.addEventListener("input", () => {
+  state.imageAssetUrl = "";
+  clearTimeout(state.imageUrlTimer);
+  const value = elements.imageUrl.value.trim();
+  if (!value) {
+    elements.imagePreview.textContent = "未选择图片";
+    return;
+  }
+  try {
+    const parsed = new URL(value);
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid protocol");
+  } catch {
+    elements.imagePreview.textContent = "请输入以 http:// 或 https:// 开头的图片 URL";
+    return;
+  }
+  elements.imagePreview.textContent = "验证图片 URL...";
+  state.imageUrlTimer = setTimeout(() => {
+    validateImageUrlInput(value)
+      .then((imageUrl) => {
+        elements.imageUrl.value = imageUrl;
+        renderImagePreview(imageUrl);
+      })
+      .catch((error) => {
+        elements.imagePreview.textContent = error.message;
+      });
+  }, 450);
 });
 
 elements.form.addEventListener("submit", async (event) => {
@@ -581,3 +714,4 @@ updatePromptMeter();
 updateEstimate();
 loadHistory();
 loadConfig();
+showDailySiteNotice();

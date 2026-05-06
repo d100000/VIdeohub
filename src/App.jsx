@@ -59,6 +59,9 @@ const providerBaseUrl = "https://www.taijiai.online/";
 const defaultModel = "seedance-2.0-720p";
 const frontendAssetVersion =
   typeof __FRONTEND_ASSET_VERSION__ !== "undefined" ? __FRONTEND_ASSET_VERSION__ : "dev";
+const imageUploadMaxBytes = 12 * 1024 * 1024;
+const imageUploadMaxLabel = "12MB";
+const imageUploadAcceptedTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 const ratioOptions = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 const durationOptions = [3, 5, 8, 10, 15];
@@ -122,7 +125,10 @@ async function api(path, options = {}) {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok || body.error) {
-    const error = new Error(body?.error?.message || `HTTP ${response.status}`);
+    const fallbackMessage = response.status === 413
+      ? `图片太大，上传失败。请压缩到 ${imageUploadMaxLabel} 以内后再上传，建议使用 JPG 或 WebP。`
+      : `HTTP ${response.status}`;
+    const error = new Error(body?.error?.message || fallbackMessage);
     error.body = body;
     error.status = response.status;
     if (path !== "/api/client-errors") {
@@ -130,13 +136,20 @@ async function api(path, options = {}) {
         code: body?.error?.code || "CLIENT_NETWORK_ERROR",
         path,
         status: response.status,
-        request: options.body ? safeJsonText(options.body) : null,
+        request: requestBodyForLog(options.body),
         response: body,
       });
     }
     throw error;
   }
   return body;
+}
+
+function requestBodyForLog(body) {
+  if (!body) return null;
+  if (body instanceof ArrayBuffer) return { type: "binary", bytes: body.byteLength };
+  if (ArrayBuffer.isView(body)) return { type: "binary", bytes: body.byteLength };
+  return safeJsonText(body);
 }
 
 function safeJsonText(value) {
@@ -152,8 +165,45 @@ function copyText(value) {
   navigator.clipboard?.writeText(String(value));
 }
 
+function localDateKey(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function assetUrl(assetId) {
-  return assetId ? `/api/assets/${assetId}` : "";
+  if (!assetId) return "";
+  const path = `/public/assets/${encodeURIComponent(assetId)}`;
+  try {
+    return new URL(path, window.location.origin).toString();
+  } catch {
+    return path;
+  }
+}
+
+function videoDownloadHref(taskId, videoUrl) {
+  if (taskId && videoUrl) return `/api/tasks/${encodeURIComponent(taskId)}/download`;
+  return videoUrl || "";
+}
+
+function VideoDownloadButton({ taskId, videoUrl, className = "secondary-button", compact = false, children = "下载视频" }) {
+  const href = videoDownloadHref(taskId, videoUrl);
+  return (
+    <a
+      className={cx(className, "video-download-button", compact && "compact", !href && "disabled")}
+      href={href || "#"}
+      download={taskId ? `${taskId}.mp4` : "video.mp4"}
+      target="_blank"
+      rel="noreferrer"
+      aria-disabled={!href}
+      onClick={(event) => {
+        if (!href) event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
+      <Download size={compact ? 14 : 15} />
+      {children}
+    </a>
+  );
 }
 
 function frontendAssetUrl(value) {
@@ -163,29 +213,61 @@ function frontendAssetUrl(value) {
   return `${pathPart}${separator}v=${encodeURIComponent(frontendAssetVersion)}${hashPart ? `#${hashPart}` : ""}`;
 }
 
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error("图片读取失败。"));
-    reader.readAsDataURL(file);
-  });
+function formatFileSize(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  return `${Math.round((bytes / 1024 / 1024) * 10) / 10}MB`;
+}
+
+function imageMimeFromFileName(fileName) {
+  const lower = String(fileName || "").toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  return "";
+}
+
+function imageUploadError(message, status = 400) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function validateImageFile(file) {
+  const mime = file.type || imageMimeFromFileName(file.name);
+  if (!imageUploadAcceptedTypes.has(mime)) {
+    throw imageUploadError("图片格式不支持。请上传 PNG、JPG 或 WebP 图片。");
+  }
+  if (file.size > imageUploadMaxBytes) {
+    throw imageUploadError(`图片太大了：当前 ${formatFileSize(file.size)}，请压缩到 ${imageUploadMaxLabel} 以内后再上传。`, 413);
+  }
+  return mime;
 }
 
 async function uploadImageAsset(file, projectId, type = "reference_image") {
   if (!file) return null;
-  const dataUrl = await fileToDataUrl(file);
-  const path = projectId ? `/api/projects/${projectId}/assets/upload` : "/api/assets/upload";
+  const mime = validateImageFile(file);
+  const params = new URLSearchParams({ type });
+  if (projectId) params.set("projectId", projectId);
+  const endpoint = projectId ? `/api/projects/${projectId}/assets/upload` : "/api/assets/upload";
+  const path = `${endpoint}?${params.toString()}`;
   const result = await api(path, {
     method: "POST",
-    body: JSON.stringify({
-      fileName: file.name,
-      dataUrl,
-      type,
-      projectId,
-    }),
+    headers: {
+      "Content-Type": mime,
+      "X-File-Name": encodeURIComponent(file.name || "upload"),
+      "X-Asset-Type": type,
+      ...(projectId ? { "X-Project-Id": projectId } : {}),
+    },
+    body: await file.arrayBuffer(),
   });
   return result.asset;
+}
+
+async function validateImageUrl(imageUrl) {
+  return api("/api/assets/validate-url", {
+    method: "POST",
+    body: JSON.stringify({ url: imageUrl }),
+  });
 }
 
 function TaskIdPill({ value, className = "", label = "Task ID", compact = false }) {
@@ -218,23 +300,138 @@ function ApiKeyHint() {
   );
 }
 
-function ImageUploadField({ label, value, onChange, projectId, type = "reference_image", helper = "上传 PNG、JPG 或 WebP 图片", compact = false, disabled = false }) {
+function DailySiteNotice() {
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    const today = localDateKey();
+    try {
+      setVisible(localStorage.getItem("cvc-daily-site-notice") !== today);
+    } catch {
+      setVisible(true);
+    }
+  }, []);
+
+  function closeNotice() {
+    try {
+      localStorage.setItem("cvc-daily-site-notice", localDateKey());
+    } catch {
+      // Local storage may be disabled; closing should still work for this page view.
+    }
+    setVisible(false);
+  }
+
+  if (!visible) return null;
+  return (
+    <div className="daily-notice-backdrop" role="presentation">
+      <section className="daily-notice" role="dialog" aria-modal="true" aria-labelledby="daily-notice-title">
+        <div className="daily-notice-icon">
+          <AlertCircle size={22} />
+        </div>
+        <div>
+          <strong id="daily-notice-title">测试站点提醒</strong>
+          <p>本站点只提供视频测试使用，图片和视频均会过期，请及时下载到本地。</p>
+        </div>
+        <button className="hero-primary" type="button" onClick={closeNotice}>
+          我知道了
+        </button>
+      </section>
+    </div>
+  );
+}
+
+function ImageUploadField({ label, value, onChange, projectId, type = "reference_image", helper = `上传后自动获取图片 URL，支持 ${imageUploadMaxLabel} 以内的 PNG、JPG 或 WebP`, compact = false, disabled = false, onUploadStateChange }) {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
+  const [urlInput, setUrlInput] = useState("");
+  const [urlStatus, setUrlStatus] = useState("idle");
+  const [urlMessage, setUrlMessage] = useState("");
+  const onChangeRef = useRef(onChange);
+  const onUploadStateChangeRef = useRef(onUploadStateChange);
+
+  useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
+
+  useEffect(() => {
+    onUploadStateChangeRef.current = onUploadStateChange;
+  }, [onUploadStateChange]);
+
+  useEffect(() => {
+    if (value || disabled) return undefined;
+    const trimmed = urlInput.trim();
+    if (!trimmed) {
+      setUrlStatus("idle");
+      setUrlMessage("");
+      return undefined;
+    }
+
+    try {
+      const parsed = new URL(trimmed);
+      if (!["http:", "https:"].includes(parsed.protocol)) {
+        throw new Error("protocol");
+      }
+    } catch {
+      setUrlStatus("error");
+      setUrlMessage("请输入以 http:// 或 https:// 开头的完整图片 URL。");
+      return undefined;
+    }
+
+    let cancelled = false;
+    setError("");
+    setUrlStatus("checking");
+    setUrlMessage("正在验证图片 URL...");
+    onUploadStateChangeRef.current?.(true);
+
+    const timer = setTimeout(async () => {
+      try {
+        const result = await validateImageUrl(trimmed);
+        if (cancelled) return;
+        setUrlStatus("ok");
+        setUrlMessage(result.sizeLabel ? `URL 可用 · ${result.sizeLabel}` : result.message || "URL 可用");
+        onChangeRef.current?.(result.url || trimmed);
+      } catch (validateError) {
+        if (cancelled) return;
+        setUrlStatus("error");
+        setUrlMessage(validateError.message);
+      } finally {
+        if (!cancelled) onUploadStateChangeRef.current?.(false);
+      }
+    }, 450);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      onUploadStateChangeRef.current?.(false);
+    };
+  }, [disabled, urlInput, value]);
+
+  function clearValue() {
+    setUrlInput("");
+    setUrlStatus("idle");
+    setUrlMessage("");
+    setError("");
+    onChange?.("");
+  }
 
   async function onFileChange(event) {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
     setUploading(true);
+    onUploadStateChange?.(true);
     setError("");
     try {
       const asset = await uploadImageAsset(file, projectId, type);
-      onChange?.(asset?.url || "");
+      setUrlInput("");
+      setUrlStatus("idle");
+      setUrlMessage("");
+      onChange?.(asset?.publicUrl || asset?.url || "");
     } catch (uploadError) {
       setError(uploadError.message);
     } finally {
       setUploading(false);
+      onUploadStateChange?.(false);
     }
   }
 
@@ -242,7 +439,7 @@ function ImageUploadField({ label, value, onChange, projectId, type = "reference
     <div className={cx("image-upload-field nodrag", compact && "compact")}>
       <div className="image-upload-head">
         <span>{label}</span>
-        {value && !disabled && <button type="button" onClick={() => onChange?.("")}>清除</button>}
+        {value && !disabled && <button type="button" onClick={clearValue}>清除</button>}
       </div>
       {value ? (
         <div className="image-upload-preview">
@@ -253,12 +450,32 @@ function ImageUploadField({ label, value, onChange, projectId, type = "reference
           </button>
         </div>
       ) : (
-        <label className="image-upload-drop">
-          <input type="file" accept="image/png,image/jpeg,image/webp" onChange={onFileChange} disabled={uploading || disabled} />
-          {uploading ? <Loader2 className="spin" size={16} /> : <Image size={16} />}
-          <strong>{uploading ? "上传中" : "上传图片"}</strong>
-          {!compact && <small>{helper}</small>}
-        </label>
+        <>
+          <label className="image-upload-drop">
+            <input type="file" accept="image/png,image/jpeg,image/webp" onChange={onFileChange} disabled={uploading || disabled} />
+            {uploading ? <Loader2 className="spin" size={16} /> : <Image size={16} />}
+            <strong>{uploading ? "上传中" : "上传图片"}</strong>
+            {!compact && <small>{helper}</small>}
+          </label>
+          <div className="image-url-entry">
+            <div className="image-url-divider">
+              <span>或粘贴图片 URL</span>
+            </div>
+            <label className={cx("image-url-input", urlStatus)}>
+              <input
+                type="url"
+                value={urlInput}
+                placeholder="https://example.com/image.webp"
+                disabled={disabled || uploading}
+                onChange={(event) => setUrlInput(event.target.value)}
+              />
+              {urlStatus === "checking" && <Loader2 className="spin" size={15} />}
+              {urlStatus === "ok" && <Check size={15} />}
+              {urlStatus === "error" && <AlertCircle size={15} />}
+            </label>
+            {urlMessage && <small className={cx("image-url-status", urlStatus)}>{urlMessage}</small>}
+          </div>
+        </>
       )}
       {error && <small className="image-upload-error">{error}</small>}
     </div>
@@ -647,12 +864,12 @@ function Onboarding({ me, reload }) {
 
   async function testKey() {
     setBusy(true);
-    setStatus("正在提交测试请求...");
+    setStatus("正在检查 API key 和 Seedance 模型权限...");
     setStatusTone("info");
     setDebug(null);
     try {
       const result = await api("/api/me/api-key/test", { method: "POST" });
-      setStatus(result.upstreamTaskId ? `测试任务已提交：${result.upstreamTaskId}` : "接口连通。");
+      setStatus(result.message || "API key 可用。");
       setStatusTone("success");
       setDebug(result.debug || result);
     } catch (error) {
@@ -712,7 +929,7 @@ function Onboarding({ me, reload }) {
           <button className="secondary-button" type="button" disabled={!me.user.apiKey?.configured || busy} onClick={testKey}>
             测试接口
           </button>
-          <span>{me.user.apiKey?.configured ? `已配置 ${me.user.apiKey.preview} · 测试会创建一个 Seedance 任务` : "尚未配置"}</span>
+          <span>{me.user.apiKey?.configured ? `已配置 ${me.user.apiKey.preview} · 测试只检查模型权限，不会生成视频` : "尚未配置"}</span>
         </div>
         <label className="project-name-field">
           项目名称
@@ -796,11 +1013,11 @@ function ProfilePage({ me, reload }) {
 
   async function testKey() {
     setBusy(true);
-    setStatus("正在提交测试请求...");
+    setStatus("正在检查 API key 和 Seedance 模型权限...");
     setStatusTone("info");
     try {
       const result = await api("/api/me/api-key/test", { method: "POST" });
-      setStatus(result.upstreamTaskId ? `测试任务已提交：${result.upstreamTaskId}` : "接口连通。");
+      setStatus(result.message || "API key 可用。");
       setStatusTone("success");
     } catch (error) {
       setStatus(error.message);
@@ -953,6 +1170,7 @@ function ProfileTaskCard({ task, onRefresh }) {
         <div className="profile-task-meta">
           <span>{task.createdAt}</span>
           {task.videoUrl && <button type="button" onClick={() => copyText(task.videoUrl)}>复制视频 URL</button>}
+          {task.videoUrl && <VideoDownloadButton taskId={task.id} videoUrl={task.videoUrl} className="profile-download-link" compact />}
           <Link to={`/task-query?taskId=${encodeURIComponent(task.id)}`}>查看结果</Link>
           {running || task.status === "failed" ? <button type="button" onClick={() => onRefresh(task.id)}>重新拉取</button> : null}
         </div>
@@ -1291,6 +1509,7 @@ function TaskCenterRow({ task, selected, checked, onCheck, onOpen, onRefresh }) 
       </span>
       <span className="task-row-actions" onClick={(event) => event.stopPropagation()}>
         {hasVideo && <button type="button" onClick={() => copyText(task.videoUrl || task.resultUrl)}>复制 URL</button>}
+        {task.videoUrl && <VideoDownloadButton taskId={task.id} videoUrl={task.videoUrl} className="text-download" compact />}
         {["queued", "submitted", "in_progress", "failed"].includes(task.status) && <button type="button" onClick={onRefresh}>重新拉取</button>}
       </span>
     </article>
@@ -1365,6 +1584,7 @@ function TaskCenterDrawer({ task, detail, loading, busy, onClose, onRefresh, onN
               <Copy size={15} />
               复制结果 URL
             </button>
+            <VideoDownloadButton taskId={currentTask.id} videoUrl={currentTask.videoUrl} />
             <button className="secondary-button" type="button" onClick={() => onNavigate(`/task-query?taskId=${encodeURIComponent(currentTask.id)}`)}>
               打开完整查询
             </button>
@@ -2164,6 +2384,7 @@ function TaskChatCard({ task, index, onDebug, onRefresh, onContinue, onSelect })
       )}
       <div className="task-actions">
         {done && <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onContinue(task); }}>生成下一镜头</button>}
+        {done && <VideoDownloadButton taskId={task.id} videoUrl={task.videoUrl} />}
         {failed && (
           <button className="secondary-button" type="button" onClick={(event) => { event.stopPropagation(); onRefresh?.(task.id); }}>
             <RotateCcw size={15} />
@@ -2240,6 +2461,7 @@ function ResultInspector({ tab, setTab, task, currentVideo, plan, tasks, taskQue
                 <strong>{currentVideo.progress ?? 100}%</strong>
               </div>
               <input value={currentVideo.videoUrl || ""} readOnly />
+              <VideoDownloadButton taskId={currentVideo.id} videoUrl={currentVideo.videoUrl} className="full-primary inspector-download" />
               <button className="full-primary" type="button" onClick={onContinue}>
                 生成下一镜头
               </button>
@@ -2530,6 +2752,7 @@ function TaskQueryResult({ detail, onRefresh }) {
               <Copy size={15} />
               复制结果 URL
             </button>
+            <VideoDownloadButton taskId={task.id} videoUrl={task.videoUrl} />
           </div>
           {task.error?.message && (
             <div className="task-query-error inline">
@@ -2921,6 +3144,7 @@ function TaskResultDrawer({ detail, onClose, onRefresh }) {
                 <Copy size={15} />
                 复制结果 URL
               </button>
+              <VideoDownloadButton taskId={task?.id} videoUrl={task?.videoUrl} />
               <button className="secondary-button" type="button" onClick={() => onRefresh?.(task?.id)} disabled={!task?.id}>
                 <RotateCcw size={15} />
                 重新查询
@@ -3163,6 +3387,7 @@ function RenderNode({ id, data, selected }) {
             生成下一镜头
           </button>
         )}
+        {done && <VideoDownloadButton taskId={data.taskId} videoUrl={data.videoUrl} className="node-ghost nodrag" compact />}
         {failed && data.taskId && (
           <button className="node-ghost nodrag" type="button" onClick={() => actions.refreshTask?.(data.taskId)}>
             <RotateCcw size={15} />
@@ -3194,7 +3419,9 @@ function NoteNode({ id, data, selected }) {
 }
 
 function AssetNode({ id, data, selected }) {
-  const patch = (field, value) => data.actions?.patchNode?.(id, { [field]: value });
+  const actions = data.actions || {};
+  const imageValue = data.url || data.referenceImageUrl || "";
+  const patchFields = (patch) => actions.patchNode?.(id, patch);
   return (
     <article className={cx("canvas-node asset-node", selected && "selected")}>
       <Handle type="source" position={Position.Right} />
@@ -3202,10 +3429,19 @@ function AssetNode({ id, data, selected }) {
         <span className="node-icon">
           <Image size={16} />
         </span>
-        <strong>{data.title || "参考图"}</strong>
+        <input className="node-title nodrag" value={data.title || "参考图"} onChange={(event) => patchFields({ title: event.target.value })} />
       </div>
-      <input className="nodrag" value={data.url || ""} onChange={(event) => patch("url", event.target.value)} placeholder="图片 URL" />
-      {data.url && <img src={data.url} alt="" />}
+      <div className="asset-upload-wrap">
+        <ImageUploadField
+          label="参考图"
+          value={imageValue}
+          onChange={(value) => patchFields({ url: value, referenceImageUrl: value })}
+          projectId={actions.projectId}
+          type="reference_image"
+          helper="本地上传或粘贴公网图片 URL"
+          compact
+        />
+      </div>
     </article>
   );
 }
@@ -3354,9 +3590,23 @@ function Studio({ me, projects, projectId }) {
     () => ({
       projectId,
       patchNode: (nodeId, patch) => {
-        setNodes((current) =>
-          current.map((node) => (node.id === nodeId ? { ...node, data: { ...node.data, ...patch } } : node)),
-        );
+        setNodes((current) => {
+          const sourceNode = current.find((node) => node.id === nodeId);
+          const assetUrlChanged = sourceNode?.type === "asset" && ("url" in patch || "referenceImageUrl" in patch);
+          const nextAssetUrl = assetUrlChanged
+            ? patch.url ?? patch.referenceImageUrl ?? sourceNode.data?.url ?? sourceNode.data?.referenceImageUrl ?? ""
+            : "";
+          const connectedShotIds = assetUrlChanged
+            ? new Set(edges.filter((edge) => edge.source === nodeId).map((edge) => edge.target))
+            : new Set();
+          return current.map((node) => {
+            if (node.id === nodeId) return { ...node, data: { ...node.data, ...patch } };
+            if (connectedShotIds.has(node.id) && node.type === "shot") {
+              return { ...node, data: { ...node.data, referenceImageUrl: nextAssetUrl } };
+            }
+            return node;
+          });
+        });
       },
       generate: (nodeId) => requestGenerateFromNode(nodeId),
       continueFrom: (nodeId) => requestContinueFromRender(nodeId),
@@ -3532,11 +3782,21 @@ function Studio({ me, projects, projectId }) {
   const onConnect = useCallback(
     (connection) => {
       if (!isValidConnection(connection)) return;
+      const sourceNode = nodes.find((node) => node.id === connection.source);
+      const targetNode = nodes.find((node) => node.id === connection.target);
+      const assetImageUrl = sourceNode?.type === "asset" && targetNode?.type === "shot"
+        ? sourceNode.data?.url || sourceNode.data?.referenceImageUrl || ""
+        : "";
       setEdges((current) =>
-        addEdge({ ...connection, id: uid("edge"), type: "smoothstep", animated: true, data: { kind: "custom" } }, current),
+        addEdge({ ...connection, id: uid("edge"), type: "smoothstep", animated: true, data: { kind: assetImageUrl ? "reference" : "custom" } }, current),
       );
+      if (assetImageUrl) {
+        setNodes((current) =>
+          current.map((node) => (node.id === connection.target ? { ...node, data: { ...node.data, referenceImageUrl: assetImageUrl } } : node)),
+        );
+      }
     },
-    [isValidConnection],
+    [isValidConnection, nodes],
   );
 
   function addShotAt(position, overrides = {}) {
@@ -3996,6 +4256,28 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
           </button>
         </>
       )}
+      {node.type === "asset" && (
+        <>
+          <label>
+            名称
+            <input value={data.title || "参考图"} onChange={(event) => patch("title", event.target.value)} />
+          </label>
+          <ImageUploadField
+            label="参考图"
+            value={data.url || data.referenceImageUrl || ""}
+            onChange={(value) => onPatch(node.id, { url: value, referenceImageUrl: value })}
+            projectId={data.actions?.projectId}
+            type="reference_image"
+            helper="本地上传或粘贴公网图片 URL；连接到镜头卡后会作为参考图使用"
+          />
+          {(data.url || data.referenceImageUrl) && (
+            <button className="secondary-button" type="button" onClick={() => copyText(data.url || data.referenceImageUrl)}>
+              <Copy size={15} />
+              复制图片 URL
+            </button>
+          )}
+        </>
+      )}
       {node.type === "render" && (
         <>
           <div className="task-summary">
@@ -4026,6 +4308,7 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
                 视频 URL
                 <input value={data.videoUrl} readOnly />
               </label>
+              <VideoDownloadButton taskId={data.taskId} videoUrl={data.videoUrl} className="full-primary" />
               <button className="full-primary" type="button" onClick={() => onContinue(node.id)}>
                 <ChevronsRight size={16} />
                 生成下一镜头
@@ -4158,6 +4441,7 @@ function SequenceBar({ clips, activeIndex, setActiveIndex }) {
           <button className="secondary-button" type="button" onClick={copyUrls}>
             复制 URL
           </button>
+          <VideoDownloadButton taskId={activeClip?.data?.taskId} videoUrl={activeClip?.data?.videoUrl} />
         </>
       )}
       <button className="secondary-button sequence-toggle" type="button" onClick={() => setCollapsed((value) => !value)}>
@@ -4172,6 +4456,7 @@ function ContinueClipModal({ title, clip, projectId = "", onClose, onSubmit }) {
   const firstFrameUrl = assetUrl(clip?.firstFrameAssetId);
   const [useLastFrame, setUseLastFrame] = useState(Boolean(lastFrameUrl));
   const [referenceImageUrl, setReferenceImageUrl] = useState("");
+  const [referenceUploading, setReferenceUploading] = useState(false);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -4187,6 +4472,7 @@ function ContinueClipModal({ title, clip, projectId = "", onClose, onSubmit }) {
         </div>
         <div className="continue-body">
           {clip?.videoUrl && <video src={clip.videoUrl} muted loop controls playsInline />}
+          {clip?.videoUrl && <VideoDownloadButton taskId={clip.id} videoUrl={clip.videoUrl} />}
           <FrameStrip firstFrameUrl={firstFrameUrl} lastFrameUrl={lastFrameUrl} />
           <label className={cx("continue-choice", !lastFrameUrl && "disabled")}>
             <input
@@ -4206,14 +4492,15 @@ function ContinueClipModal({ title, clip, projectId = "", onClose, onSubmit }) {
             onChange={setReferenceImageUrl}
             projectId={projectId}
             helper="可上传人物、产品、风格或构图参考图"
+            onUploadStateChange={setReferenceUploading}
           />
           <div className="continue-actions">
             <button className="secondary-button" type="button" onClick={onClose}>
               取消
             </button>
-            <button className="hero-primary" type="button" onClick={() => onSubmit?.({ useLastFrame, referenceImageUrl })}>
-              <ChevronsRight size={16} />
-              创建下一镜头
+            <button className="hero-primary" type="button" disabled={referenceUploading} onClick={() => onSubmit?.({ useLastFrame, referenceImageUrl })}>
+              {referenceUploading ? <Loader2 className="spin" size={16} /> : <ChevronsRight size={16} />}
+              {referenceUploading ? "图片上传中" : "创建下一镜头"}
             </button>
           </div>
         </div>
@@ -4308,6 +4595,7 @@ function AppRoutes() {
 export default function App() {
   return (
     <BrowserRouter>
+      <DailySiteNotice />
       <AppRoutes />
     </BrowserRouter>
   );
