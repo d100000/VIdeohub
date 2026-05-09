@@ -79,6 +79,149 @@ const strengthOptions = [
   ["medium", "中"],
   ["high", "高"],
 ];
+const referenceSubjectOptions = [
+  ["person", "真人图"],
+  ["generic", "普通图"],
+];
+
+function normalizeReferenceSubjectType(value) {
+  return String(value || "").trim().toLowerCase() === "person" ? "person" : "generic";
+}
+
+function normalizeReferenceAssetsForForm(value, fallbackUrl = "") {
+  const assets = Array.isArray(value)
+    ? value
+    : value && Array.isArray(value.referenceAssets)
+      ? value.referenceAssets
+      : [];
+  if (assets.length) {
+    return assets.map((asset) => ({
+      url: String(asset?.url || asset?.imageUrl || "").trim(),
+      subjectType: normalizeReferenceSubjectType(asset?.subjectType || asset?.subject_type),
+    }));
+  }
+  const legacyUrl = String(
+    fallbackUrl ||
+      (value && !Array.isArray(value) ? value.referenceImageUrl || "" : ""),
+  ).trim();
+  return legacyUrl ? [{ url: legacyUrl, subjectType: "generic" }] : [];
+}
+
+function sanitizeReferenceAssets(value) {
+  return normalizeReferenceAssetsForForm(value).filter((asset) => asset.url);
+}
+
+function primaryReferenceAssetUrl(value, fallbackUrl = "") {
+  return sanitizeReferenceAssets(normalizeReferenceAssetsForForm(value, fallbackUrl))[0]?.url || "";
+}
+
+function buildReferenceAssetsPatch(nextAssets) {
+  const normalized = normalizeReferenceAssetsForForm(nextAssets).map((asset) => ({
+    url: String(asset?.url || "").trim(),
+    subjectType: normalizeReferenceSubjectType(asset?.subjectType),
+  }));
+  return {
+    referenceAssets: normalized,
+    referenceImageUrl: normalized.find((asset) => asset.url)?.url || "",
+  };
+}
+
+function syncReferenceAssetsWithAsset(value, nextAsset, previousAsset = null) {
+  const assets = sanitizeReferenceAssets(normalizeReferenceAssetsForForm(value));
+  const previousUrl = String(previousAsset?.url || "").trim();
+  const nextUrl = String(nextAsset?.url || "").trim();
+  const normalizedNextAsset = nextUrl
+    ? {
+      url: nextUrl,
+      subjectType: normalizeReferenceSubjectType(nextAsset?.subjectType),
+    }
+    : null;
+  const previousIndex = previousUrl ? assets.findIndex((asset) => asset.url === previousUrl) : -1;
+  const nextAssets = [...assets];
+
+  if (previousIndex >= 0) {
+    if (normalizedNextAsset) {
+      nextAssets[previousIndex] = normalizedNextAsset;
+      const duplicateIndex = nextAssets.findIndex((asset, index) => asset.url === nextUrl && index !== previousIndex);
+      if (duplicateIndex >= 0) nextAssets.splice(duplicateIndex, 1);
+    } else {
+      nextAssets.splice(previousIndex, 1);
+    }
+    return nextAssets;
+  }
+
+  if (!normalizedNextAsset) return nextAssets;
+  const existingIndex = nextAssets.findIndex((asset) => asset.url === nextUrl);
+  if (existingIndex >= 0) {
+    nextAssets[existingIndex] = normalizedNextAsset;
+  } else {
+    nextAssets.push(normalizedNextAsset);
+  }
+  return nextAssets;
+}
+
+function hasComposingInput(event) {
+  return Boolean(event?.nativeEvent?.isComposing || event?.isComposing || event?.keyCode === 229);
+}
+
+function BufferedTextarea({ value, onValueChange, commitDelay = 180, onFocus, onBlur, onCompositionStart, onCompositionEnd, ...props }) {
+  const externalValue = String(value || "");
+  const [draft, setDraft] = useState(externalValue);
+  const [focused, setFocused] = useState(false);
+  const [composing, setComposing] = useState(false);
+
+  useEffect(() => {
+    if (!focused && !composing) {
+      setDraft(externalValue);
+    }
+  }, [composing, externalValue, focused]);
+
+  useEffect(() => {
+    if (!focused || composing || draft === externalValue) return undefined;
+    const timer = window.setTimeout(() => {
+      onValueChange?.(draft);
+    }, commitDelay);
+    return () => window.clearTimeout(timer);
+  }, [commitDelay, composing, draft, externalValue, focused, onValueChange]);
+
+  function commit(nextValue) {
+    if (nextValue !== externalValue) onValueChange?.(nextValue);
+  }
+
+  return (
+    <textarea
+      {...props}
+      value={draft}
+      onChange={(event) => {
+        const nextValue = event.target.value;
+        setDraft(nextValue);
+        if (hasComposingInput(event)) setComposing(true);
+      }}
+      onFocus={(event) => {
+        setFocused(true);
+        onFocus?.(event);
+      }}
+      onBlur={(event) => {
+        const nextValue = event.target.value;
+        setFocused(false);
+        setDraft(nextValue);
+        commit(nextValue);
+        onBlur?.(event);
+      }}
+      onCompositionStart={(event) => {
+        setComposing(true);
+        onCompositionStart?.(event);
+      }}
+      onCompositionEnd={(event) => {
+        const nextValue = event.target.value;
+        setComposing(false);
+        setDraft(nextValue);
+        commit(nextValue);
+        onCompositionEnd?.(event);
+      }}
+    />
+  );
+}
 
 const breadcrumbs = [];
 
@@ -482,6 +625,104 @@ function ImageUploadField({ label, value, onChange, projectId, type = "reference
   );
 }
 
+function ReferenceAssetsField({ label = "参考图", value, legacyValue = "", onChange, projectId, helper = "上传后可在提示词里用 @1、@2 引用；首尾帧请单独填写。", compact = false, disabled = false, onUploadStateChange }) {
+  const assets = normalizeReferenceAssetsForForm(value, legacyValue);
+  const [uploadingMap, setUploadingMap] = useState({});
+  const anyUploading = Object.values(uploadingMap).some(Boolean);
+
+  useEffect(() => {
+    onUploadStateChange?.(anyUploading);
+  }, [anyUploading, onUploadStateChange]);
+
+  function patchAssets(nextAssets) {
+    onChange?.(nextAssets.map((asset) => ({
+      url: String(asset?.url || "").trim(),
+      subjectType: normalizeReferenceSubjectType(asset?.subjectType),
+    })));
+  }
+
+  function patchAsset(index, patch) {
+    patchAssets(assets.map((asset, assetIndex) => (
+      assetIndex === index ? { ...asset, ...patch } : asset
+    )));
+  }
+
+  function addAsset() {
+    patchAssets([...assets, { url: "", subjectType: "generic" }]);
+  }
+
+  function removeAsset(index) {
+    patchAssets(assets.filter((_, assetIndex) => assetIndex !== index));
+    setUploadingMap((current) => {
+      const next = { ...current };
+      delete next[index];
+      return next;
+    });
+  }
+
+  return (
+    <section className={cx("reference-assets-field", compact && "compact")}>
+      <div className="reference-assets-head">
+        <div>
+          <strong>{label}</strong>
+          {!compact && <small>{helper}</small>}
+        </div>
+        {!disabled && (
+          <button type="button" onClick={addAsset}>
+            <Plus size={14} />
+            添加
+          </button>
+        )}
+      </div>
+      {assets.length ? (
+        <div className="reference-assets-list">
+          {assets.map((asset, index) => (
+            <article className="reference-asset-card" key={`${asset.url || "empty"}-${index}`}>
+              <div className="reference-asset-card-head">
+                <span>@{index + 1}</span>
+                <div className="reference-asset-controls">
+                  <select
+                    value={asset.subjectType}
+                    disabled={disabled}
+                    onChange={(event) => patchAsset(index, { subjectType: event.target.value })}
+                  >
+                    {referenceSubjectOptions.map(([optionValue, optionLabel]) => (
+                      <option key={optionValue} value={optionValue}>
+                        {optionLabel}
+                      </option>
+                    ))}
+                  </select>
+                  {!disabled && (
+                    <button type="button" onClick={() => removeAsset(index)}>
+                      <Trash2 size={14} />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <ImageUploadField
+                label={`参考图 ${index + 1}`}
+                value={asset.url || ""}
+                onChange={(nextValue) => patchAsset(index, { url: nextValue })}
+                projectId={projectId}
+                compact={compact}
+                disabled={disabled}
+                onUploadStateChange={(active) => {
+                  setUploadingMap((current) => ({ ...current, [index]: active }));
+                }}
+              />
+            </article>
+          ))}
+        </div>
+      ) : (
+        <div className="reference-assets-empty">
+          <span>暂无参考图。</span>
+          <small>添加后可在提示词里用 @1、@2 指代对应素材。</small>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function FrameStrip({ firstFrameUrl, lastFrameUrl, compact = false }) {
   if (!firstFrameUrl && !lastFrameUrl) return null;
   return (
@@ -547,7 +788,10 @@ function defaultShotData(overrides = {}) {
     ratio: "16:9",
     resolution: "720p",
     model: defaultModel,
+    referenceAssets: [],
     referenceImageUrl: "",
+    referenceVideoUrl: "",
+    referenceAudioUrl: "",
     firstFrameUrl: "",
     lastFrameUrl: "",
     cameraMotion: "slow_push_in",
@@ -1861,6 +2105,7 @@ function ChatPage({ me }) {
           text: "延续上一镜头，继续描述下一段动作...",
           fromTaskId: options.fromTaskId || continueTaskId || selectedTaskId,
           useLastFrame: options.useLastFrame,
+          referenceAssets: sanitizeReferenceAssets(options.referenceAssets || []),
           referenceImageUrl: options.referenceImageUrl || "",
         }),
       });
@@ -1887,10 +2132,6 @@ function ChatPage({ me }) {
   async function openTaskLogs(taskId) {
     if (!taskId) return;
     const result = await api(`/api/tasks/${taskId}/logs`);
-    if (result.events?.[0]) {
-      setDebugModal(result.events[0]);
-      return;
-    }
     setDebugModal(result);
   }
 
@@ -2017,7 +2258,7 @@ function ChatPage({ me }) {
           </div>
           <div className="composer-row">
             <textarea value={text} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
+              if (event.key === "Enter" && !event.shiftKey && !hasComposingInput(event)) {
                 event.preventDefault();
                 if (text.trim()) sendPlan();
               }
@@ -2049,7 +2290,13 @@ function ChatPage({ me }) {
           onSubmit={(options) => continueNext({ ...options, fromTaskId: continueTaskId })}
         />
       )}
-      {debugModal && (debugModal.eventId ? <ErrorLogModal event={debugModal} onClose={() => setDebugModal(null)} /> : <DebugModal detail={debugModal} onClose={() => setDebugModal(null)} />)}
+      {debugModal && (
+        debugModal.eventId
+          ? <ErrorLogModal event={debugModal} onClose={() => setDebugModal(null)} />
+          : debugModal.task
+            ? <TaskLogModal detail={debugModal} onClose={() => setDebugModal(null)} />
+            : <DebugModal detail={debugModal} onClose={() => setDebugModal(null)} />
+      )}
     </main>
   );
 }
@@ -2223,7 +2470,8 @@ function GenerationConfirmCard({ value, onChange, onSubmit, canSubmit = true, su
       </div>
       <label>
         Prompt
-        <textarea value={prompt} readOnly={readonly} onChange={(event) => patch(promptField, event.target.value)} />
+        <BufferedTextarea value={prompt} readOnly={readonly} onValueChange={(nextValue) => patch(promptField, nextValue)} />
+        <small className="prompt-reference-hint">素材会按 content 顺序编号；上传参考图后可以在提示词里用 @1、@2 指代，参考视频和参考音频会继续占用后续编号。首尾帧请单独填写，且不要和其他参考混用。</small>
       </label>
       <label>
         Negative Prompt
@@ -2271,7 +2519,27 @@ function GenerationConfirmCard({ value, onChange, onSubmit, canSubmit = true, su
       </button>
       {advancedOpen && (
         <div className="confirm-advanced">
-          <ImageUploadField label="参考图" value={value.referenceImageUrl || ""} onChange={(nextValue) => patch("referenceImageUrl", nextValue)} projectId={uploadProjectId} disabled={readonly} />
+          <div className="confirm-advanced-span">
+            <ReferenceAssetsField
+              value={value.referenceAssets}
+              legacyValue={value.referenceImageUrl || ""}
+              onChange={(nextAssets) => {
+                const nextPatch = buildReferenceAssetsPatch(nextAssets);
+                patch("referenceAssets", nextPatch.referenceAssets);
+                patch("referenceImageUrl", nextPatch.referenceImageUrl);
+              }}
+              projectId={uploadProjectId}
+              disabled={readonly}
+            />
+          </div>
+          <label>
+            参考视频 URL
+            <input value={value.referenceVideoUrl || ""} readOnly={readonly} onChange={(event) => patch("referenceVideoUrl", event.target.value)} placeholder="https://example.com/reference.mp4" />
+          </label>
+          <label>
+            参考音频 URL
+            <input value={value.referenceAudioUrl || ""} readOnly={readonly} onChange={(event) => patch("referenceAudioUrl", event.target.value)} placeholder="https://example.com/reference.mp3" />
+          </label>
           <ImageUploadField label="首帧" value={value.firstFrameUrl || ""} onChange={(nextValue) => patch("firstFrameUrl", nextValue)} projectId={uploadProjectId} type="first_frame" disabled={readonly} />
           <ImageUploadField label="尾帧" value={value.lastFrameUrl || ""} onChange={(nextValue) => patch("lastFrameUrl", nextValue)} projectId={uploadProjectId} type="last_frame" disabled={readonly} />
           <label>
@@ -3237,6 +3505,72 @@ function ErrorLogModal({ event, onClose }) {
   );
 }
 
+function TaskLogModal({ detail, onClose }) {
+  const [tab, setTab] = useState("overview");
+  const [search, setSearch] = useState("");
+  const tabs = [
+    ["overview", "概览"],
+    ["request", "请求体"],
+    ["response", "接口返回"],
+    ["providerRequest", "上游请求"],
+    ["providerResponse", "上游返回"],
+    ["providerRawText", "rawText"],
+    ["error", "错误对象"],
+    ["debug", "调试信息"],
+    ["logs", "请求轨迹"],
+    ["events", "错误事件"],
+  ];
+  const payload = tab === "overview"
+    ? {
+      task: detail.task,
+      requestId: detail.events?.[0]?.requestId || detail.logs?.[0]?.requestId || "",
+      requestLogCount: detail.logs?.length || 0,
+      errorEventCount: detail.events?.length || 0,
+      hasResponse: detail.response !== null && detail.response !== undefined,
+      hasError: Boolean(detail.error),
+    }
+    : detail?.[tab] ?? null;
+  const rendered = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  const filtered = search
+    ? rendered.split("\n").filter((line) => line.toLowerCase().includes(search.toLowerCase())).join("\n") || "未找到匹配内容"
+    : rendered;
+  const fullText = JSON.stringify(detail, null, 2);
+
+  function copy(value) {
+    navigator.clipboard?.writeText(value);
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <section className="error-log-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <strong>任务完整日志</strong>
+            <span>{detail.task?.id} · {detail.task?.upstreamTaskId || "等待上游 task"}</span>
+          </div>
+          <button className="tool-button" type="button" onClick={onClose}>
+            <Check size={17} />
+          </button>
+        </div>
+        <div className="log-toolbar">
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索请求体、返回体、错误或调试信息" />
+          <button className="secondary-button" type="button" onClick={() => copy(fullText)}>复制完整日志</button>
+          <button className="secondary-button" type="button" onClick={() => copy(detail.task?.id || "")}>复制 taskId</button>
+          <button className="secondary-button" type="button" onClick={() => copy(detail.task?.upstreamTaskId || "")}>复制上游 taskId</button>
+        </div>
+        <div className="log-tabs">
+          {tabs.map(([value, label]) => (
+            <button className={cx(tab === value && "active")} key={value} type="button" onClick={() => setTab(value)}>
+              {label}
+            </button>
+          ))}
+        </div>
+        <pre className="full-log-content">{filtered || "null"}</pre>
+      </section>
+    </div>
+  );
+}
+
 function StudioGate({ me }) {
   const params = useParams();
   const navigate = useNavigate();
@@ -3285,12 +3619,13 @@ function ShotNode({ id, data, selected }) {
         <input className="node-title nodrag" value={data.title || ""} onChange={(event) => patch("title", event.target.value)} />
       </div>
       {data.frameLockNotice && <div className="node-warning">{data.frameLockNotice}</div>}
-      <textarea
+      <BufferedTextarea
         className="prompt-box nodrag"
         value={data.prompt || ""}
-        onChange={(event) => patch("prompt", event.target.value)}
+        onValueChange={(nextValue) => patch("prompt", nextValue)}
         placeholder="描述这个镜头里发生什么..."
       />
+      <div className="prompt-reference-note">@1、@2 会按 content 里的参考素材顺序编号；首尾帧请在右侧参数里单独设置，且不要和其他参考混用。</div>
       <div className="compact-grid">
         <label className="nodrag">
           秒数
@@ -3312,10 +3647,10 @@ function ShotNode({ id, data, selected }) {
         </label>
       </div>
       <div className="node-upload-wrap">
-        <ImageUploadField
-          label="参考图"
-          value={data.referenceImageUrl || ""}
-          onChange={(value) => patch("referenceImageUrl", value)}
+        <ReferenceAssetsField
+          value={data.referenceAssets}
+          legacyValue={data.referenceImageUrl || ""}
+          onChange={(nextAssets) => actions.patchNode?.(id, buildReferenceAssetsPatch(nextAssets))}
           projectId={actions.projectId}
           compact
         />
@@ -3431,6 +3766,16 @@ function AssetNode({ id, data, selected }) {
         </span>
         <input className="node-title nodrag" value={data.title || "参考图"} onChange={(event) => patchFields({ title: event.target.value })} />
       </div>
+      <label className="mini-field nodrag">
+        参考类型
+        <select value={normalizeReferenceSubjectType(data.subjectType)} onChange={(event) => patchFields({ subjectType: event.target.value })}>
+          {referenceSubjectOptions.map(([optionValue, optionLabel]) => (
+            <option key={optionValue} value={optionValue}>
+              {optionLabel}
+            </option>
+          ))}
+        </select>
+      </label>
       <div className="asset-upload-wrap">
         <ImageUploadField
           label="参考图"
@@ -3592,17 +3937,27 @@ function Studio({ me, projects, projectId }) {
       patchNode: (nodeId, patch) => {
         setNodes((current) => {
           const sourceNode = current.find((node) => node.id === nodeId);
-          const assetUrlChanged = sourceNode?.type === "asset" && ("url" in patch || "referenceImageUrl" in patch);
-          const nextAssetUrl = assetUrlChanged
-            ? patch.url ?? patch.referenceImageUrl ?? sourceNode.data?.url ?? sourceNode.data?.referenceImageUrl ?? ""
-            : "";
-          const connectedShotIds = assetUrlChanged
+          const assetReferenceChanged = sourceNode?.type === "asset" && ("url" in patch || "referenceImageUrl" in patch || "subjectType" in patch);
+          const previousAsset = assetReferenceChanged
+            ? {
+              url: sourceNode.data?.url || sourceNode.data?.referenceImageUrl || "",
+              subjectType: normalizeReferenceSubjectType(sourceNode.data?.subjectType),
+            }
+            : null;
+          const nextAsset = assetReferenceChanged
+            ? {
+              url: patch.url ?? patch.referenceImageUrl ?? sourceNode.data?.url ?? sourceNode.data?.referenceImageUrl ?? "",
+              subjectType: patch.subjectType ?? sourceNode.data?.subjectType,
+            }
+            : null;
+          const connectedShotIds = assetReferenceChanged
             ? new Set(edges.filter((edge) => edge.source === nodeId).map((edge) => edge.target))
             : new Set();
           return current.map((node) => {
             if (node.id === nodeId) return { ...node, data: { ...node.data, ...patch } };
             if (connectedShotIds.has(node.id) && node.type === "shot") {
-              return { ...node, data: { ...node.data, referenceImageUrl: nextAssetUrl } };
+              const nextPatch = buildReferenceAssetsPatch(syncReferenceAssetsWithAsset(node.data, nextAsset, previousAsset));
+              return { ...node, data: { ...node.data, ...nextPatch } };
             }
             return node;
           });
@@ -3784,15 +4139,22 @@ function Studio({ me, projects, projectId }) {
       if (!isValidConnection(connection)) return;
       const sourceNode = nodes.find((node) => node.id === connection.source);
       const targetNode = nodes.find((node) => node.id === connection.target);
-      const assetImageUrl = sourceNode?.type === "asset" && targetNode?.type === "shot"
-        ? sourceNode.data?.url || sourceNode.data?.referenceImageUrl || ""
-        : "";
+      const assetReference = sourceNode?.type === "asset" && targetNode?.type === "shot"
+        ? {
+          url: sourceNode.data?.url || sourceNode.data?.referenceImageUrl || "",
+          subjectType: sourceNode.data?.subjectType,
+        }
+        : null;
       setEdges((current) =>
-        addEdge({ ...connection, id: uid("edge"), type: "smoothstep", animated: true, data: { kind: assetImageUrl ? "reference" : "custom" } }, current),
+        addEdge({ ...connection, id: uid("edge"), type: "smoothstep", animated: true, data: { kind: assetReference?.url ? "reference" : "custom" } }, current),
       );
-      if (assetImageUrl) {
+      if (assetReference?.url) {
         setNodes((current) =>
-          current.map((node) => (node.id === connection.target ? { ...node, data: { ...node.data, referenceImageUrl: assetImageUrl } } : node)),
+          current.map((node) => {
+            if (node.id !== connection.target) return node;
+            const nextPatch = buildReferenceAssetsPatch(syncReferenceAssetsWithAsset(node.data, assetReference));
+            return { ...node, data: { ...node.data, ...nextPatch } };
+          }),
         );
       }
     },
@@ -3828,7 +4190,7 @@ function Studio({ me, projects, projectId }) {
       id: uid("asset"),
       type: "asset",
       position,
-      data: { title: "参考图", url: "" },
+      data: { title: "参考图", url: "", subjectType: "generic" },
     };
     setNodes((current) => [...current, node]);
     setSelectedNodeId(node.id);
@@ -3927,6 +4289,7 @@ function Studio({ me, projects, projectId }) {
         method: "POST",
         body: JSON.stringify({
           useLastFrame: options.useLastFrame,
+          referenceAssets: sanitizeReferenceAssets(options.referenceAssets || []),
           referenceImageUrl: options.referenceImageUrl || "",
         }),
       });
@@ -3979,7 +4342,7 @@ function Studio({ me, projects, projectId }) {
     if (!taskId && !eventId) return;
     try {
       const result = eventId ? await api(`/api/error-events/${eventId}`) : await api(`/api/tasks/${taskId}/logs`);
-      setDebugModal(result);
+      setDebugModal(eventId ? result.event : result);
     } catch (error) {
       setDebugModal(error.body || { message: error.message });
     }
@@ -4153,7 +4516,13 @@ function Studio({ me, projects, projectId }) {
           onSubmit={(options) => continueFromRender(continueNode.id, options)}
         />
       )}
-      {debugModal && <DebugModal detail={debugModal} onClose={() => setDebugModal(null)} />}
+      {debugModal && (
+        debugModal.eventId
+          ? <ErrorLogModal event={debugModal} onClose={() => setDebugModal(null)} />
+          : debugModal.task
+            ? <TaskLogModal detail={debugModal} onClose={() => setDebugModal(null)} />
+            : <DebugModal detail={debugModal} onClose={() => setDebugModal(null)} />
+      )}
     </main>
   );
 }
@@ -4181,7 +4550,8 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
         <>
           <label>
             提示词
-            <textarea value={data.prompt || ""} onChange={(event) => patch("prompt", event.target.value)} />
+            <BufferedTextarea value={data.prompt || ""} onValueChange={(nextValue) => patch("prompt", nextValue)} />
+            <small className="prompt-reference-hint">参考素材会按 content 顺序编号；参考图上传后可在文案里用 @1、@2 指代，参考视频和参考音频会继续占用后续编号。首尾帧请单独填写，且不要和其他参考混用。</small>
           </label>
           <label>
             反向提示词
@@ -4211,7 +4581,20 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
             模型
             <input value={data.model || defaultModel} onChange={(event) => patch("model", event.target.value)} />
           </label>
-          <ImageUploadField label="参考图" value={data.referenceImageUrl || ""} onChange={(value) => patch("referenceImageUrl", value)} projectId={data.actions?.projectId} />
+          <ReferenceAssetsField
+            value={data.referenceAssets}
+            legacyValue={data.referenceImageUrl || ""}
+            onChange={(nextAssets) => onPatch(node.id, buildReferenceAssetsPatch(nextAssets))}
+            projectId={data.actions?.projectId}
+          />
+          <label>
+            参考视频 URL
+            <input value={data.referenceVideoUrl || ""} onChange={(event) => patch("referenceVideoUrl", event.target.value)} placeholder="https://example.com/reference.mp4" />
+          </label>
+          <label>
+            参考音频 URL
+            <input value={data.referenceAudioUrl || ""} onChange={(event) => patch("referenceAudioUrl", event.target.value)} placeholder="https://example.com/reference.mp3" />
+          </label>
           <ImageUploadField label="首帧" value={data.firstFrameUrl || ""} onChange={(value) => patch("firstFrameUrl", value)} projectId={data.actions?.projectId} type="first_frame" />
           <ImageUploadField label="尾帧" value={data.lastFrameUrl || ""} onChange={(value) => patch("lastFrameUrl", value)} projectId={data.actions?.projectId} type="last_frame" />
           <div className="panel-grid">
@@ -4261,6 +4644,16 @@ function PropertyPanel({ node, onPatch, onGenerate, onContinue, onRefreshTask })
           <label>
             名称
             <input value={data.title || "参考图"} onChange={(event) => patch("title", event.target.value)} />
+          </label>
+          <label>
+            参考类型
+            <select value={normalizeReferenceSubjectType(data.subjectType)} onChange={(event) => patch("subjectType", event.target.value)}>
+              {referenceSubjectOptions.map(([optionValue, optionLabel]) => (
+                <option key={optionValue} value={optionValue}>
+                  {optionLabel}
+                </option>
+              ))}
+            </select>
           </label>
           <ImageUploadField
             label="参考图"
@@ -4455,7 +4848,7 @@ function ContinueClipModal({ title, clip, projectId = "", onClose, onSubmit }) {
   const lastFrameUrl = assetUrl(clip?.lastFrameAssetId);
   const firstFrameUrl = assetUrl(clip?.firstFrameAssetId);
   const [useLastFrame, setUseLastFrame] = useState(Boolean(lastFrameUrl));
-  const [referenceImageUrl, setReferenceImageUrl] = useState("");
+  const [referenceAssets, setReferenceAssets] = useState([]);
   const [referenceUploading, setReferenceUploading] = useState(false);
 
   return (
@@ -4486,19 +4879,28 @@ function ContinueClipModal({ title, clip, projectId = "", onClose, onSubmit }) {
               <span>{lastFrameUrl ? "推荐用于连续视频，能更稳地衔接画面。" : "当前还没有尾帧资产，可以先重新拉取任务或直接逻辑续写。"}</span>
             </div>
           </label>
-          <ImageUploadField
+          <ReferenceAssetsField
             label="额外参考图"
-            value={referenceImageUrl}
-            onChange={setReferenceImageUrl}
+            value={referenceAssets}
+            onChange={setReferenceAssets}
             projectId={projectId}
-            helper="可上传人物、产品、风格或构图参考图"
+            helper="可上传人物、产品、风格或构图参考图，并在下一段提示词里用 @1、@2 引用。"
             onUploadStateChange={setReferenceUploading}
           />
           <div className="continue-actions">
             <button className="secondary-button" type="button" onClick={onClose}>
               取消
             </button>
-            <button className="hero-primary" type="button" disabled={referenceUploading} onClick={() => onSubmit?.({ useLastFrame, referenceImageUrl })}>
+            <button
+              className="hero-primary"
+              type="button"
+              disabled={referenceUploading}
+              onClick={() => onSubmit?.({
+                useLastFrame,
+                referenceAssets: sanitizeReferenceAssets(referenceAssets),
+                referenceImageUrl: primaryReferenceAssetUrl(referenceAssets),
+              })}
+            >
               {referenceUploading ? <Loader2 className="spin" size={16} /> : <ChevronsRight size={16} />}
               {referenceUploading ? "图片上传中" : "创建下一镜头"}
             </button>

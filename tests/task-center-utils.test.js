@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { buildFrameCaptureAttempts, missingFrameAssets } from "../lib/frame-extraction-utils.js";
 import {
   csvCell,
   parseTaskListFilters,
@@ -85,4 +86,40 @@ test("taskSourceLabel covers known and custom sources", () => {
   assert.equal(taskSourceLabel("test"), "测试任务");
   assert.equal(taskSourceLabel("external"), "external");
   assert.equal(taskSourceLabel(""), "画布");
+});
+
+test("missingFrameAssets only requests the frames that are still absent", () => {
+  assert.deepEqual(missingFrameAssets({}), {
+    needFirstFrame: true,
+    needLastFrame: true,
+  });
+
+  assert.deepEqual(missingFrameAssets({ last_frame_asset_id: "asset_last" }), {
+    needFirstFrame: true,
+    needLastFrame: false,
+  });
+
+  assert.deepEqual(missingFrameAssets({ firstFrameAssetId: "asset_first", lastFrameAssetId: "asset_last" }), {
+    needFirstFrame: false,
+    needLastFrame: false,
+  });
+});
+
+test("buildFrameCaptureAttempts configures robust ffmpeg single-image output", () => {
+  const firstAttempts = buildFrameCaptureAttempts({
+    frame: "first",
+    inputPath: "/tmp/input.mp4",
+    outputPath: "/tmp/first.jpg",
+  });
+  assert.equal(firstAttempts[0].label, "decode_first_frame");
+  assert.deepEqual(firstAttempts[0].args.slice(-6), ["-frames:v", "1", "-update", "1", "-q:v", "2", "/tmp/first.jpg"].slice(-6));
+  assert.match(firstAttempts[0].args.join(" "), /select=eq\(n\\,0\)/);
+
+  const lastAttempts = buildFrameCaptureAttempts({
+    frame: "last",
+    inputPath: "/tmp/input.mp4",
+    outputPath: "/tmp/last.jpg",
+  });
+  assert.equal(lastAttempts[0].label, "seek_from_end");
+  assert.match(lastAttempts[0].args.join(" "), /-sseof -0\.1/);
 });

@@ -14,6 +14,21 @@ import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
+  buildFrameCaptureAttempts,
+  missingFrameAssets,
+} from "./lib/frame-extraction-utils.js";
+import {
+  normalizeReferenceAssets,
+  primaryReferenceImageUrl,
+} from "./lib/reference-asset-utils.js";
+import {
+  buildFrameImageContentItem,
+  buildReferenceAudioContentItem,
+  buildReferenceImageContentItem,
+  buildReferenceVideoContentItem,
+  buildSeedanceTextContentItem,
+} from "./lib/seedance-content-utils.js";
+import {
   parseTaskListFilters,
   taskListWhere,
   taskSourceLabel,
@@ -454,6 +469,19 @@ const statements = {
       AND (? = '' OR generation_tasks.id LIKE ? OR generation_tasks.upstream_task_id LIKE ? OR generation_tasks.video_url LIKE ?)
       AND (? = '' OR generation_tasks.status = ?)
     ORDER BY generation_tasks.created_at DESC
+    LIMIT ?
+  `),
+  tasksMissingFrameAssets: db.prepare(`
+    SELECT *
+    FROM generation_tasks
+    WHERE status = 'completed'
+      AND video_url IS NOT NULL
+      AND video_url != ''
+      AND (
+        first_frame_asset_id IS NULL OR first_frame_asset_id = '' OR
+        last_frame_asset_id IS NULL OR last_frame_asset_id = ''
+      )
+    ORDER BY updated_at DESC
     LIMIT ?
   `),
   createCreationSession: db.prepare(`
@@ -1162,7 +1190,10 @@ function defaultShotData(overrides = {}) {
     ratio: "16:9",
     resolution: "720p",
     model: defaultModel,
+    referenceAssets: [],
     referenceImageUrl: "",
+    referenceVideoUrl: "",
+    referenceAudioUrl: "",
     firstFrameUrl: "",
     lastFrameUrl: "",
     cameraMotion: "slow_push_in",
@@ -1339,9 +1370,32 @@ function buildPrompt(data) {
   return parts.filter(Boolean).join(" ");
 }
 
+function buildContentItems({ promptText, referenceAssets, referenceVideoUrl, referenceAudioUrl, firstFrame, lastFrame }) {
+  const content = [buildSeedanceTextContentItem(promptText)].filter(Boolean);
+
+  for (const asset of referenceAssets) {
+    const item = buildReferenceImageContentItem(asset);
+    if (item) content.push(item);
+  }
+
+  const referenceVideoItem = buildReferenceVideoContentItem(referenceVideoUrl);
+  if (referenceVideoItem) content.push(referenceVideoItem);
+
+  const referenceAudioItem = buildReferenceAudioContentItem(referenceAudioUrl);
+  if (referenceAudioItem) content.push(referenceAudioItem);
+
+  const firstFrameItem = buildFrameImageContentItem(firstFrame, "first_frame");
+  if (firstFrameItem) content.push(firstFrameItem);
+
+  const lastFrameItem = buildFrameImageContentItem(lastFrame, "last_frame");
+  if (lastFrameItem) content.push(lastFrameItem);
+
+  return content;
+}
+
 function buildGenerationPayload(data) {
-  const prompt = buildPrompt(data);
-  if (!prompt) {
+  const promptText = buildPrompt(data);
+  if (!promptText) {
     const error = new Error("请输入提示词。");
     error.statusCode = 400;
     throw error;
@@ -1350,14 +1404,37 @@ function buildGenerationPayload(data) {
   const duration = Math.min(Math.max(Number(data.duration || 5), 3), 15);
   const [width, height] = ratioToSize(data.ratio);
   const seed = data.seed === "" || data.seed === undefined ? undefined : Number(data.seed);
-  const firstFrame = String(data.firstFrameUrl || data.referenceImageUrl || "").trim();
+  const explicitReferenceAssets = normalizeReferenceAssets(
+    Array.isArray(data.referenceAssets) ? data.referenceAssets : data,
+    data.referenceImageUrl,
+  );
+  const legacyReferenceUrl = explicitReferenceAssets[0]?.url || "";
+  const referenceVideoUrl = String(data.referenceVideoUrl || "").trim();
+  const referenceAudioUrl = String(data.referenceAudioUrl || "").trim();
+  const firstFrame = String(data.firstFrameUrl || "").trim();
   const lastFrame = String(data.lastFrameUrl || "").trim();
   if (lastFrame && !firstFrame) {
-    const error = new Error("使用尾帧时需要同时提供首帧或参考图。");
+    const error = new Error("使用尾帧时需要同时提供首帧。");
     error.statusCode = 400;
     throw error;
   }
-  const imageUrls = [firstFrame, lastFrame].filter(Boolean);
+  if ((firstFrame || lastFrame) && (explicitReferenceAssets.length || referenceVideoUrl || referenceAudioUrl)) {
+    const error = new Error("使用首尾帧时不能同时添加参考图、参考视频或参考音频。");
+    error.statusCode = 400;
+    throw error;
+  }
+  const primaryReferenceUrl = primaryReferenceImageUrl(explicitReferenceAssets) || legacyReferenceUrl;
+  const contentItems = buildContentItems({
+    promptText,
+    referenceAssets: explicitReferenceAssets,
+    referenceVideoUrl,
+    referenceAudioUrl,
+    firstFrame,
+    lastFrame,
+  });
+  const compatibilityPrompt = String(
+    data.compatibilityPrompt || "Prompt is carried in content[0].text for Seedance compatibility.",
+  ).trim();
 
   const metadata = {
     ratio: data.ratio || "16:9",
@@ -1371,22 +1448,32 @@ function buildGenerationPayload(data) {
   if (Number.isFinite(seed)) metadata.seed = seed;
   if (firstFrame) metadata.first_frame_url = firstFrame;
   if (lastFrame) metadata.last_frame_url = lastFrame;
-  if (data.referenceImageUrl) metadata.reference_image_url = data.referenceImageUrl;
+  if (primaryReferenceUrl) metadata.reference_image_url = primaryReferenceUrl;
+  if (explicitReferenceAssets.length) {
+    metadata.reference_images = explicitReferenceAssets.map((asset) => ({
+      url: asset.url,
+      subject_type: asset.subjectType,
+    }));
+  }
 
   const payload = {
     model: data.model || defaultModel,
-    prompt,
+    prompt: compatibilityPrompt || "Seedance compatibility prompt.",
     duration,
+    ratio: data.ratio || "16:9",
+    generate_audio: Boolean(data.generateAudio),
     width,
     height,
     n: 1,
     metadata,
   };
 
-  if (imageUrls.length) {
-    payload.image = imageUrls[0];
-    payload.image_urls = imageUrls;
-    metadata.input_mode = imageUrls.length > 1 ? "first_last_frame" : "image_to_video";
+  payload.content = contentItems;
+
+  if (firstFrame || lastFrame) {
+    metadata.input_mode = lastFrame ? "first_last_frame" : "image_to_video";
+  } else if (explicitReferenceAssets.length || referenceVideoUrl || referenceAudioUrl) {
+    metadata.input_mode = "reference_content";
   }
 
   return payload;
@@ -1498,6 +1585,35 @@ async function resolveProviderImageInputs(userId, payload, req) {
         payload.metadata[key] = await resolveProviderImageInput(userId, payload.metadata[key], req, cache);
       }
     }
+    if (Array.isArray(payload.metadata.reference_images)) {
+      payload.metadata.reference_images = await Promise.all(payload.metadata.reference_images.map(async (item) => ({
+        ...item,
+        url: item?.url ? await resolveProviderImageInput(userId, item.url, req, cache) : "",
+      })));
+    }
+  }
+  if (Array.isArray(payload.content)) {
+    payload.content = await Promise.all(payload.content.map(async (item) => {
+      if (!item || typeof item !== "object") return item;
+      const next = { ...item };
+      if (next.image_url?.url) {
+        next.image_url = {
+          ...next.image_url,
+          url: await resolveProviderImageInput(userId, next.image_url.url, req, cache),
+        };
+      }
+      if (next.video_url?.url) {
+        const normalized = normalizeExternalDownloadUrl(next.video_url.url);
+        await assertPublicDownloadUrlTarget(normalized);
+        next.video_url = { ...next.video_url, url: normalized };
+      }
+      if (next.audio_url?.url) {
+        const normalized = normalizeExternalDownloadUrl(next.audio_url.url);
+        await assertPublicDownloadUrlTarget(normalized);
+        next.audio_url = { ...next.audio_url, url: normalized };
+      }
+      return next;
+    }));
   }
   return payload;
 }
@@ -1593,7 +1709,46 @@ function createImageAsset({ userId, projectId, type, source, filePath, metadata 
   return assetId;
 }
 
-async function extractVideoFrames({ userId, projectId, taskId, videoUrl }) {
+function cleanFfmpegError(error) {
+  const raw = String(error?.stderr || error?.stdout || error?.message || "").trim();
+  if (!raw) return "ffmpeg exited without details.";
+  return raw.split("\n").slice(-6).join(" ").slice(0, 500);
+}
+
+async function captureFrameWithFallback({ frame, inputPath, outputPath }) {
+  const attempts = buildFrameCaptureAttempts({ frame, inputPath, outputPath });
+  let lastError = null;
+  let lastStrategy = "";
+
+  for (const attempt of attempts) {
+    lastStrategy = attempt.label;
+    try {
+      fs.rmSync(outputPath, { force: true });
+      await execFileAsync("ffmpeg", attempt.args);
+      if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+        return { ok: true, strategy: attempt.label, error: "" };
+      }
+      lastError = new Error("ffmpeg completed without producing an image file.");
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  return {
+    ok: false,
+    strategy: lastStrategy,
+    error: cleanFfmpegError(lastError),
+  };
+}
+
+function frameExtractionLogMessage(taskId, videoUrl, diagnostics = {}) {
+  const details = [];
+  if (diagnostics.first?.error) details.push(`first=${diagnostics.first.strategy || "failed"}:${diagnostics.first.error}`);
+  if (diagnostics.last?.error) details.push(`last=${diagnostics.last.strategy || "failed"}:${diagnostics.last.error}`);
+  return `Frame extraction incomplete for ${taskId || "unknown"} (${videoUrl || "no-video-url"}): ${details.join(" | ")}`.slice(0, 600);
+}
+
+async function extractVideoFrames({ userId, projectId, taskId, videoUrl, needFirstFrame = true, needLastFrame = true }) {
   if (!videoUrl) return null;
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cvc-frame-"));
   const tempVideo = path.join(tempRoot, "source.mp4");
@@ -1604,33 +1759,24 @@ async function extractVideoFrames({ userId, projectId, taskId, videoUrl }) {
     if (!response.ok) throw new Error(`下载视频失败：HTTP ${response.status}`);
     const buffer = Buffer.from(await response.arrayBuffer());
     fs.writeFileSync(tempVideo, buffer);
-    await execFileAsync("ffmpeg", [
-      "-y",
-      "-ss",
-      "0",
-      "-i",
-      tempVideo,
-      "-frames:v",
-      "1",
-      "-q:v",
-      "2",
-      tempFirstFrame,
-    ]).catch(() => null);
-    await execFileAsync("ffmpeg", [
-      "-y",
-      "-sseof",
-      "-0.1",
-      "-i",
-      tempVideo,
-      "-frames:v",
-      "1",
-      "-q:v",
-      "2",
-      tempFrame,
-    ]).catch(() => null);
+    const diagnostics = {};
+    if (needFirstFrame) {
+      diagnostics.first = await captureFrameWithFallback({
+        frame: "first",
+        inputPath: tempVideo,
+        outputPath: tempFirstFrame,
+      });
+    }
+    if (needLastFrame) {
+      diagnostics.last = await captureFrameWithFallback({
+        frame: "last",
+        inputPath: tempVideo,
+        outputPath: tempFrame,
+      });
+    }
 
     return {
-      firstFrameAssetId: fs.existsSync(tempFirstFrame)
+      firstFrameAssetId: needFirstFrame && fs.existsSync(tempFirstFrame)
         ? createImageAsset({
             userId,
             projectId,
@@ -1640,7 +1786,7 @@ async function extractVideoFrames({ userId, projectId, taskId, videoUrl }) {
             metadata: { taskId, videoUrl, position: "first" },
           })
         : null,
-      lastFrameAssetId: fs.existsSync(tempFrame)
+      lastFrameAssetId: needLastFrame && fs.existsSync(tempFrame)
         ? createImageAsset({
             userId,
             projectId,
@@ -1650,9 +1796,18 @@ async function extractVideoFrames({ userId, projectId, taskId, videoUrl }) {
             metadata: { taskId, videoUrl, position: "last" },
           })
         : null,
+      diagnostics,
     };
   } catch (error) {
-    return { firstFrameAssetId: null, lastFrameAssetId: null };
+    return {
+      firstFrameAssetId: null,
+      lastFrameAssetId: null,
+      diagnostics: {
+        fatal: {
+          error: cleanFfmpegError(error),
+        },
+      },
+    };
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
@@ -1674,16 +1829,37 @@ function updateRenderNode(projectId, nodeId, patch) {
 
 async function ensureTaskFrameAssets(task) {
   if (!task?.video_url || task.status !== "completed") return task;
-  if (task.first_frame_asset_id && task.last_frame_asset_id) return task;
+  const missing = missingFrameAssets(task);
+  if (!missing.needFirstFrame && !missing.needLastFrame) return task;
 
   const extracted = await extractVideoFrames({
     userId: task.user_id,
     projectId: task.project_id,
     taskId: task.id,
     videoUrl: task.video_url,
+    needFirstFrame: missing.needFirstFrame,
+    needLastFrame: missing.needLastFrame,
   });
   const firstFrameAssetId = task.first_frame_asset_id || extracted?.firstFrameAssetId || null;
   const lastFrameAssetId = task.last_frame_asset_id || extracted?.lastFrameAssetId || null;
+  if ((missing.needFirstFrame && !firstFrameAssetId) || (missing.needLastFrame && !lastFrameAssetId)) {
+    const message = extracted?.diagnostics?.fatal?.error
+      ? `Frame extraction failed for ${task.id}: ${extracted.diagnostics.fatal.error}`.slice(0, 600)
+      : frameExtractionLogMessage(task.id, task.video_url, extracted?.diagnostics);
+    console.warn(message);
+    recordRequestLog(null, {
+      action: "frame_extract_incomplete",
+      userId: task.user_id,
+      projectId: task.project_id,
+      taskId: task.id,
+      nodeId: task.result_node_id,
+      sourceNodeId: task.source_node_id,
+      providerTaskId: task.upstream_task_id,
+      status: task.status,
+      message,
+      hasError: true,
+    });
+  }
   if (!firstFrameAssetId && !lastFrameAssetId) return task;
 
   statements.updateTaskState.run(
@@ -1723,16 +1899,37 @@ async function refreshTask(task, userId, req = null, options = {}) {
     const resolvedVideoUrl = normalized.videoUrl || task.video_url;
     let firstFrameAssetId = task.first_frame_asset_id;
     let lastFrameAssetId = task.last_frame_asset_id;
+    const missing = missingFrameAssets(task);
 
-    if (nextStatus === "completed" && resolvedVideoUrl && (!firstFrameAssetId || !lastFrameAssetId)) {
+    if (nextStatus === "completed" && resolvedVideoUrl && (missing.needFirstFrame || missing.needLastFrame)) {
       const extracted = await extractVideoFrames({
         userId,
         projectId: task.project_id,
         taskId: task.id,
         videoUrl: resolvedVideoUrl,
+        needFirstFrame: missing.needFirstFrame,
+        needLastFrame: missing.needLastFrame,
       });
       firstFrameAssetId = firstFrameAssetId || extracted?.firstFrameAssetId || null;
       lastFrameAssetId = lastFrameAssetId || extracted?.lastFrameAssetId || null;
+      if ((missing.needFirstFrame && !firstFrameAssetId) || (missing.needLastFrame && !lastFrameAssetId)) {
+        const message = extracted?.diagnostics?.fatal?.error
+          ? `Frame extraction failed for ${task.id}: ${extracted.diagnostics.fatal.error}`.slice(0, 600)
+          : frameExtractionLogMessage(task.id, resolvedVideoUrl, extracted?.diagnostics);
+        console.warn(message);
+        recordRequestLog(req, {
+          action: "frame_extract_incomplete",
+          userId,
+          projectId: task.project_id,
+          taskId: task.id,
+          nodeId: task.result_node_id,
+          sourceNodeId: task.source_node_id,
+          providerTaskId: task.upstream_task_id,
+          status: nextStatus,
+          message,
+          hasError: true,
+        });
+      }
     }
 
     statements.updateTaskState.run(
@@ -1832,6 +2029,23 @@ function taskResponse(task) {
     createdAt: task.created_at,
     updatedAt: task.updated_at,
     completedAt: task.completed_at,
+  };
+}
+
+function taskDetailResponse(task, extras = {}) {
+  if (!task) return null;
+  const debug = jsonParse(task.debug_json, null);
+  return {
+    task: taskResponse(task),
+    request: jsonParse(task.request_json, {}),
+    response: jsonParse(task.response_json, null),
+    error: jsonParse(task.error_json, null),
+    debug,
+    providerRequest: debug?.upstreamRequest || null,
+    providerResponse: debug?.upstreamResponse || null,
+    providerRawText: debug?.upstreamResponse?.rawText || null,
+    logs: Array.isArray(extras.logs) ? extras.logs : [],
+    events: Array.isArray(extras.events) ? extras.events : [],
   };
 }
 
@@ -2363,10 +2577,29 @@ function scheduleImageAssetCleanup() {
   timer.unref?.();
 }
 
+async function repairMissingFrameAssets(limit = 12) {
+  const tasks = statements.tasksMissingFrameAssets.all(limit);
+  for (const task of tasks) {
+    try {
+      await ensureTaskFrameAssets(task);
+    } catch (error) {
+      console.warn(`Frame repair failed for ${task.id}: ${cleanFfmpegError(error)}`);
+    }
+  }
+  if (tasks.length) {
+    console.log(`Frame asset repair pass complete: scanned=${tasks.length}`);
+  }
+}
+
 ensureAdminAccount();
 backfillRequestLogs();
 statements.cleanupSessions.run();
 scheduleImageAssetCleanup();
+setTimeout(() => {
+  repairMissingFrameAssets().catch((error) => {
+    console.warn(`Initial frame asset repair failed: ${cleanFfmpegError(error)}`);
+  });
+}, 1500).unref?.();
 
 app.post("/api/auth/register", async (req, res) => {
   try {
@@ -2772,7 +3005,7 @@ function parsePlannerInput(text, overrides = {}) {
 
   return {
     intent: storyboard ? "storyboard" : "single_clip",
-    mode: referenceUrl ? "image_to_video" : "text_to_video",
+    mode: referenceUrl ? "reference_content" : "text_to_video",
     displayPrompt: raw,
     modelPrompt,
     negativePrompt: negative.join(", "),
@@ -2782,8 +3015,9 @@ function parsePlannerInput(text, overrides = {}) {
     model: defaultModel,
     cameraMotion,
     motionStrength: /强烈|高运动|fast/i.test(lower) ? "high" : /轻微|慢|subtle/i.test(lower) ? "low" : "medium",
+    referenceAssets: referenceUrl ? [{ url: referenceUrl, subjectType: "generic" }] : [],
     referenceImageUrl: referenceUrl,
-    firstFrameUrl: referenceUrl,
+    firstFrameUrl: "",
     lastFrameUrl: "",
     variantCount: /3个|三个|变体|variant/i.test(raw) ? 3 : 1,
     needsClarification: raw.length < 8,
@@ -2967,6 +3201,7 @@ app.post("/api/creation-sessions/:sessionId/generate", requireAuth, async (req, 
       ratio: plan.ratio || "16:9",
       resolution: plan.resolution || "720p",
       model: plan.model || defaultModel,
+      referenceAssets: Array.isArray(plan.referenceAssets) ? plan.referenceAssets : [],
       referenceImageUrl: plan.referenceImageUrl || "",
       firstFrameUrl: plan.firstFrameUrl || "",
       lastFrameUrl: plan.lastFrameUrl || "",
@@ -3096,9 +3331,11 @@ app.post("/api/creation-sessions/:sessionId/continue", requireAuth, (req, res) =
   const useLastFrame = req.body.useLastFrame !== false;
   const lastFrameUrl = useLastFrame && last.last_frame_asset_id ? assetPublicUrl(last.last_frame_asset_id, req) : "";
   const referenceImageUrl = String(req.body.referenceImageUrl || "").trim();
+  const referenceAssets = normalizeReferenceAssets(req.body.referenceAssets);
   const plan = parsePlannerInput(req.body.text || "延续上一镜头，继续描述下一段动作...", {
-    referenceImageUrl,
-    firstFrameUrl: lastFrameUrl || referenceImageUrl,
+    referenceAssets,
+    referenceImageUrl: referenceImageUrl || primaryReferenceImageUrl(referenceAssets),
+    firstFrameUrl: lastFrameUrl || "",
     previousTaskId: last.task_id,
     previousVideoUrl: last.video_url,
     continuationUsesLastFrame: Boolean(lastFrameUrl),
@@ -3473,6 +3710,7 @@ app.post("/api/projects/:projectId/render-nodes/:nodeId/continue", requireAuth, 
   const firstFrameAssetId = useLastFrame ? task?.last_frame_asset_id || "" : "";
   const firstFrameUrl = firstFrameAssetId ? assetPublicUrl(firstFrameAssetId, req) : "";
   const uploadedReferenceUrl = String(req.body.referenceImageUrl || "").trim();
+  const referenceAssets = normalizeReferenceAssets(req.body.referenceAssets);
   const nextShotId = id("shot");
   const edgeId = id("edge");
   const nextShot = {
@@ -3489,7 +3727,8 @@ app.post("/api/projects/:projectId/render-nodes/:nodeId/continue", requireAuth, 
       cameraMotion: sourceData.cameraMotion || "slow_push_in",
       motionStrength: sourceData.motionStrength || "medium",
       firstFrameUrl,
-      referenceImageUrl: uploadedReferenceUrl,
+      referenceAssets,
+      referenceImageUrl: uploadedReferenceUrl || primaryReferenceImageUrl(referenceAssets),
       previousVideoUrl: task?.video_url || renderData.videoUrl || "",
       previousTaskId: task?.id || renderData.taskId || "",
       firstFrameAssetId,
@@ -3604,7 +3843,9 @@ app.get("/api/task-query/:taskId", requireAuth, async (req, res) => {
     severity: row.severity,
     createdAt: row.created_at,
   }));
-  res.json({ task: taskResponse(task), logs, events });
+  res.json({
+    ...taskDetailResponse(task, { logs, events }),
+  });
 });
 
 app.get("/api/tasks/:taskId/debug", requireAuth, (req, res) => {
@@ -3613,13 +3854,7 @@ app.get("/api/tasks/:taskId/debug", requireAuth, (req, res) => {
     res.status(404).json({ error: { message: "任务不存在。" } });
     return;
   }
-  res.json({
-    task: taskResponse(task),
-    request: jsonParse(task.request_json, {}),
-    response: jsonParse(task.response_json, null),
-    error: jsonParse(task.error_json, null),
-    debug: jsonParse(task.debug_json, null),
-  });
+  res.json(taskDetailResponse(task));
 });
 
 app.get("/api/tasks/:taskId/download", requireAuth, async (req, res, next) => {
@@ -3676,8 +3911,9 @@ app.get("/api/tasks/:taskId/logs", requireAuth, (req, res) => {
     res.status(404).json({ error: { message: "任务不存在。", code: "VALIDATION_ERROR", requestId: req.requestId } });
     return;
   }
+  const logs = statements.requestLogsForUserTask.all(req.params.taskId, req.user.id).map(requestLogRowToSummary);
   const events = statements.errorEventsForTask.all(req.params.taskId, req.user.id).map(errorRowToDetail);
-  res.json({ task: taskResponse(task), events });
+  res.json(taskDetailResponse(task, { logs, events }));
 });
 
 const imageUploadRawParser = express.raw({

@@ -1616,6 +1616,116 @@ a {
   font-size: 12px;
 }
 
+.reference-assets-field {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.reference-assets-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.reference-assets-head > div {
+  display: grid;
+  gap: 4px;
+}
+
+.reference-assets-head strong {
+  color: #bfdbfe;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.reference-assets-head small,
+.reference-assets-empty small,
+.prompt-reference-hint,
+.prompt-reference-note {
+  color: #94a3b8;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.reference-assets-head button,
+.reference-asset-controls button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+  color: #bfdbfe;
+  border: 1px solid rgba(96,165,250,.18);
+  background: rgba(37,99,235,.1);
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.reference-assets-list {
+  display: grid;
+  gap: 10px;
+}
+
+.reference-asset-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(255,255,255,.08);
+  background: rgba(15,23,42,.5);
+  border-radius: 10px;
+}
+
+.reference-asset-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.reference-asset-card-head span {
+  color: #dbeafe;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.reference-asset-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reference-asset-controls select {
+  min-width: 100px;
+  min-height: 30px;
+  padding: 0 10px;
+  color: #f8fafc;
+  border: 1px solid rgba(96,165,250,.2);
+  background: rgba(255,255,255,.07);
+  border-radius: 8px;
+}
+
+.reference-assets-empty {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  color: #dbeafe;
+  border: 1px dashed rgba(96,165,250,.24);
+  background: rgba(37,99,235,.08);
+  border-radius: 10px;
+}
+
+.reference-assets-field.compact .reference-assets-head small {
+  display: none;
+}
+
+.reference-assets-field.compact .reference-asset-card {
+  padding: 8px;
+}
+
 .frame-strip {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2769,6 +2879,10 @@ a {
   gap: 10px;
 }
 
+.confirm-advanced-span {
+  grid-column: 1 / -1;
+}
+
 .confirm-advanced-toggle {
   width: fit-content;
   min-height: 34px;
@@ -3581,6 +3695,10 @@ a {
   border-radius: 8px;
   outline: none;
   resize: none;
+}
+
+.prompt-reference-note {
+  padding: 0 12px 10px;
 }
 
 .compact-grid,

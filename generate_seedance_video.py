@@ -2,7 +2,8 @@
 """Create and download a short Seedance video task.
 
 The script reads the API key from NEWAPI_API_KEY, or ARK_API_KEY as a fallback.
-It supports the New API gateway shape and the official Volcengine Ark shape.
+It supports the New API gateway content payload shape and the official
+Volcengine Ark shape.
 """
 
 from __future__ import annotations
@@ -23,15 +24,15 @@ from urllib.request import Request, urlopen
 DEFAULT_BASE_URL = "https://newapi.isnothing.net/"
 DEFAULT_MODEL = "seedance-2.0-720p"
 DEFAULT_PROMPT = (
-    "A peaceful 5-second cinematic shot of a small paper boat drifting across "
-    "a sunlit pond, gentle ripples, soft morning light, realistic motion, no "
-    "text, no logos."
+    "真人质感，@1 骑着马在沙尘暴之间坚定地向前跑去，近景，俯视，@1 低着头，"
+    "他头上的斗笠遮住了他的眼睛，只能看到鼻子和嘴"
 )
+DEFAULT_REFERENCE_IMAGE_URL = "https://videohub.taijiai.online/public/assets/asset_afecd273d72049cf0ae8.jpg"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
-TERMINAL_STATUSES = {"completed", "succeeded", "failed", "cancelled", "canceled", "expired"}
+TERMINAL_STATUSES = {"completed", "succeeded", "failed", "failure", "cancelled", "canceled", "expired"}
 SUCCESS_STATUSES = {"completed", "succeeded"}
 
 
@@ -93,21 +94,74 @@ def nested_get(data: dict[str, Any], *paths: str) -> Any:
     return None
 
 
-def create_newapi_task(args: argparse.Namespace, api_key: str) -> tuple[str, str]:
-    url = join_url(args.base_url, "/v1/video/generations")
+def build_content(args: argparse.Namespace) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": args.content_text or args.prompt,
+        }
+    ]
+
+    for url in args.reference_image_url:
+        content.append(
+            {
+                "type": "image_url",
+                "role": "reference_image",
+                "subject_type": args.reference_subject_type,
+                "image_url": {
+                    "url": url,
+                },
+            }
+        )
+
+    for url in args.reference_video_url:
+        content.append(
+            {
+                "type": "video_url",
+                "role": "reference_video",
+                "video_url": {
+                    "url": url,
+                },
+            }
+        )
+
+    for url in args.reference_audio_url:
+        content.append(
+            {
+                "type": "audio_url",
+                "role": "reference_audio",
+                "audio_url": {
+                    "url": url,
+                },
+            }
+        )
+
+    return content
+
+
+def build_newapi_payload(args: argparse.Namespace) -> dict[str, Any]:
     payload = {
         "model": args.model,
-        "prompt": args.prompt,
         "duration": args.duration,
-        "width": args.width,
-        "height": args.height,
-        "n": 1,
-        "metadata": {
-            "ratio": args.ratio,
-            "resolution": args.resolution,
-            "watermark": args.watermark,
-        },
+        "ratio": args.ratio,
+        "resolution": args.resolution,
+        "generate_audio": args.generate_audio,
+        "prompt": args.prompt,
+        "content": build_content(args),
     }
+    if args.include_size:
+        payload["width"] = args.width
+        payload["height"] = args.height
+    if args.include_n:
+        payload["n"] = 1
+    if args.watermark:
+        payload["metadata"] = {"watermark": True}
+    return payload
+
+
+def create_newapi_task(args: argparse.Namespace, api_key: str) -> tuple[str, str]:
+    url = join_url(args.base_url, "/v1/video/generations")
+    payload = build_newapi_payload(args)
     print(f"Creating New API video task: {url}")
     created = request_json("POST", url, api_key, payload, timeout=args.request_timeout)
     task_id = nested_get(created, "task_id", "id", "data.task_id", "data.id")
@@ -121,11 +175,12 @@ def create_ark_task(args: argparse.Namespace, api_key: str) -> tuple[str, str]:
     url = join_url(args.base_url, "/api/v3/contents/generations/tasks")
     payload = {
         "model": args.model,
-        "content": [{"type": "text", "text": args.prompt}],
+        "content": build_content(args),
         "resolution": args.resolution,
         "ratio": args.ratio,
         "duration": args.duration,
         "watermark": args.watermark,
+        "generate_audio": args.generate_audio,
     }
     print(f"Creating Ark video task: {url}")
     created = request_json("POST", url, api_key, payload, timeout=args.request_timeout)
@@ -146,15 +201,36 @@ def get_task(args: argparse.Namespace, api_key: str, mode: str, task_id: str) ->
 
 def poll_task(args: argparse.Namespace, api_key: str, mode: str, task_id: str) -> dict[str, Any]:
     deadline = time.monotonic() + args.timeout
+    consecutive_errors = 0
     while True:
-        result = get_task(args, api_key, mode, task_id)
-        status = str(nested_get(result, "status", "data.status") or "").lower()
-        print(f"Task status: {status or 'unknown'}")
+        try:
+            result = get_task(args, api_key, mode, task_id)
+            consecutive_errors = 0
+        except ApiError as exc:
+            consecutive_errors += 1
+            if consecutive_errors > args.max_poll_errors or time.monotonic() >= deadline:
+                raise
+            print(f"Polling failed ({consecutive_errors}/{args.max_poll_errors}), retrying: {exc}", flush=True)
+            time.sleep(args.poll_interval)
+            continue
+
+        status = str(nested_get(result, "status", "data.status", "data.data.status") or "").lower()
+        print(f"Task status: {status or 'unknown'}", flush=True)
 
         if status in SUCCESS_STATUSES:
             return result
         if status in TERMINAL_STATUSES:
-            raise ApiError(f"Task ended with status={status}: {json.dumps(result, ensure_ascii=False)}")
+            fail_reason = nested_get(
+                result,
+                "fail_reason",
+                "message",
+                "data.fail_reason",
+                "data.message",
+                "data.error.message",
+                "data.data.error.message",
+            )
+            details = f", reason={fail_reason}" if fail_reason else ""
+            raise ApiError(f"Task ended with status={status}{details}: {json.dumps(result, ensure_ascii=False)}")
         if time.monotonic() >= deadline:
             raise ApiError(f"Timed out waiting for task {task_id}")
         time.sleep(args.poll_interval)
@@ -169,6 +245,7 @@ def find_video_url(result: dict[str, Any]) -> str:
         "data.url",
         "data.video_url",
         "data.content.video_url",
+        "data.data.video_url",
         "output.url",
         "output.video_url",
     )
@@ -194,29 +271,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=os.getenv("NEWAPI_BASE_URL", DEFAULT_BASE_URL))
     parser.add_argument("--model", default=os.getenv("SEEDANCE_MODEL", DEFAULT_MODEL))
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--content-text", default="", help="Text item for content[0]. Defaults to --prompt.")
     parser.add_argument("--duration", type=int, default=5)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--ratio", default="16:9")
     parser.add_argument("--resolution", default="720p")
+    parser.add_argument("--generate-audio", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--watermark", action="store_true")
+    parser.add_argument(
+        "--reference-image-url",
+        action="append",
+        default=[],
+        help="Reference image URL. May be passed multiple times. Defaults to the sample URL.",
+    )
+    parser.add_argument("--no-default-reference-image", action="store_true")
+    parser.add_argument("--reference-subject-type", default="generic", choices=("generic", "person", "product", "scene"))
+    parser.add_argument("--reference-video-url", action="append", default=[])
+    parser.add_argument("--reference-audio-url", action="append", default=[])
+    parser.add_argument("--include-size", action="store_true", help="Also send width/height for gateways that require them.")
+    parser.add_argument("--include-n", action="store_true", help="Also send n=1 for gateways that require it.")
     parser.add_argument("--output", default="seedance_test_5s.mp4")
     parser.add_argument("--mode", choices=("newapi", "ark", "auto"), default="auto")
+    parser.add_argument("--task-id", default="", help="Resume polling an existing task id instead of creating a new task.")
     parser.add_argument("--timeout", type=int, default=20 * 60)
     parser.add_argument("--poll-interval", type=int, default=15)
+    parser.add_argument("--max-poll-errors", type=int, default=5)
     parser.add_argument("--request-timeout", type=int, default=60)
-    return parser.parse_args()
+    parser.add_argument("--dry-run", action="store_true", help="Print the request payload without calling the API.")
+    args = parser.parse_args()
+    if not args.reference_image_url and not args.no_default_reference_image:
+        args.reference_image_url = [DEFAULT_REFERENCE_IMAGE_URL]
+    return args
 
 
 def main() -> int:
     args = parse_args()
+    if args.dry_run:
+        payload = build_newapi_payload(args) if args.mode != "ark" else {
+            "model": args.model,
+            "content": build_content(args),
+            "resolution": args.resolution,
+            "ratio": args.ratio,
+            "duration": args.duration,
+            "watermark": args.watermark,
+            "generate_audio": args.generate_audio,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
     api_key = os.getenv("NEWAPI_API_KEY") or os.getenv("ARK_API_KEY")
     if not api_key:
         print("Set NEWAPI_API_KEY first, for example: export NEWAPI_API_KEY='sk-...'", file=sys.stderr)
         return 2
 
     try:
-        if args.mode == "ark":
+        if args.task_id:
+            mode = "ark" if args.mode == "ark" else "newapi"
+            task_id = args.task_id
+            print(f"Resuming {mode} task: {task_id}", flush=True)
+        elif args.mode == "ark":
             mode, task_id = create_ark_task(args, api_key)
         elif args.mode == "newapi":
             mode, task_id = create_newapi_task(args, api_key)
