@@ -3136,6 +3136,7 @@ a {
 
 .pipeline-error-card {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   margin-top: 14px;
@@ -3149,8 +3150,13 @@ a {
 .pipeline-error-card div {
   display: grid;
   gap: 4px;
-  flex: 1;
+  flex: 1 1 0%;
   min-width: 0;
+}
+
+.pipeline-error-card strong {
+  overflow-wrap: anywhere;
+  word-break: break-all;
 }
 
 .pipeline-error-card span,
@@ -3158,11 +3164,21 @@ a {
   color: #fca5a5;
   font-size: 12px;
   overflow-wrap: anywhere;
+  word-break: break-all;
 }
 
 .pipeline-error-card.standalone {
   align-items: flex-start;
-  justify-content: space-between;
+  padding: 16px;
+  background:
+    linear-gradient(180deg, rgba(127, 29, 29, .32), rgba(127, 29, 29, .22)),
+    rgba(10, 14, 24, .92);
+  border: 1px solid rgba(239, 68, 68, .32);
+  border-radius: 10px;
+}
+
+.pipeline-error-card .secondary-button {
+  flex-shrink: 0;
 }
 
 .continuation-strip {
