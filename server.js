@@ -47,6 +47,13 @@ const providerBaseUrl = "https://www.taijiai.online";
 const defaultModel = process.env.SEEDANCE_MODEL || "seedance-2.0-720p";
 const appSecret = process.env.APP_SECRET || process.env.SESSION_SECRET || "local-dev-secret-change-me";
 const cookieName = "cvc_sid";
+
+const oauthClientId = process.env.OAUTH_CLIENT_ID || "";
+const oauthClientSecret = process.env.OAUTH_CLIENT_SECRET || "";
+const oauthAuthorizeUrl = process.env.OAUTH_AUTHORIZE_URL || "";
+const oauthTokenUrl = process.env.OAUTH_TOKEN_URL || "";
+const oauthUserinfoUrl = process.env.OAUTH_USERINFO_URL || "";
+const oauthCallbackUrl = process.env.OAUTH_CALLBACK_URL || "";
 const dataDir = path.join(__dirname, "data");
 const assetDir = path.join(dataDir, "assets");
 const logDir = path.join(dataDir, "logs");
@@ -118,9 +125,13 @@ function migrate() {
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
+      password_hash TEXT NOT NULL DEFAULT '',
       is_admin INTEGER NOT NULL DEFAULT 0,
       must_reset_password INTEGER NOT NULL DEFAULT 0,
+      username TEXT NOT NULL DEFAULT '',
+      display_name TEXT NOT NULL DEFAULT '',
+      oauth_provider TEXT NOT NULL DEFAULT '',
+      oauth_provider_user_id TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -330,6 +341,12 @@ function migrate() {
   `);
   ensureColumn("users", "is_admin", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn("users", "must_reset_password", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("users", "oauth_provider", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("users", "oauth_provider_user_id", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("users", "username", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("users", "display_name", "TEXT NOT NULL DEFAULT ''");
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_binding ON users(oauth_provider, oauth_provider_user_id) WHERE oauth_provider != '' AND oauth_provider_user_id != ''`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
   ensureColumn("generation_tasks", "source", "TEXT NOT NULL DEFAULT 'canvas'");
   ensureColumn("generation_tasks", "first_frame_asset_id", "TEXT");
   db.exec(`
@@ -344,14 +361,17 @@ migrate();
 
 const statements = {
   userByEmail: db.prepare("SELECT * FROM users WHERE lower(email) = lower(?)"),
-  userById: db.prepare("SELECT id, email, is_admin, must_reset_password, created_at FROM users WHERE id = ?"),
+  userByOAuth: db.prepare("SELECT * FROM users WHERE oauth_provider = ? AND oauth_provider_user_id = ?"),
+  userById: db.prepare("SELECT id, email, username, display_name, is_admin, must_reset_password, oauth_provider, oauth_provider_user_id, created_at FROM users WHERE id = ?"),
   createUser: db.prepare("INSERT INTO users (email, password_hash) VALUES (?, ?)"),
   createAdminUser: db.prepare("INSERT INTO users (email, password_hash, is_admin, must_reset_password) VALUES (?, ?, 1, 1)"),
   promoteAdminUser: db.prepare("UPDATE users SET is_admin = 1 WHERE id = ?"),
   updateUserPassword: db.prepare("UPDATE users SET password_hash = ?, must_reset_password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"),
+  createOAuthUser: db.prepare("INSERT INTO users (email, username, display_name, is_admin, oauth_provider, oauth_provider_user_id) VALUES (?, ?, ?, ?, ?, ?)"),
+  updateOAuthUser: db.prepare("UPDATE users SET email = ?, username = ?, display_name = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"),
   createSession: db.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)"),
   sessionById: db.prepare(`
-    SELECT sessions.*, users.email, users.is_admin, users.must_reset_password
+    SELECT sessions.*, users.email, users.username, users.display_name, users.is_admin, users.must_reset_password, users.oauth_provider
     FROM sessions
     JOIN users ON users.id = sessions.user_id
     WHERE sessions.id = ? AND sessions.expires_at > CURRENT_TIMESTAMP
@@ -919,6 +939,8 @@ function publicUser(userId) {
   return {
     id: user.id,
     email: user.email,
+    username: user.username,
+    displayName: user.display_name,
     isAdmin: Boolean(user.is_admin),
     passwordResetRequired: Boolean(user.must_reset_password),
     createdAt: user.created_at,
@@ -961,6 +983,8 @@ function requireAuth(req, res, next) {
   req.user = {
     id: session.user_id,
     email: session.email,
+    username: session.username,
+    displayName: session.display_name,
     isAdmin: Boolean(session.is_admin),
     passwordResetRequired: Boolean(session.must_reset_password),
   };
@@ -991,6 +1015,7 @@ function requireAdminReady(req, res, next) {
   }
   next();
 }
+
 
 function requireProject(req, res, next) {
   const project = statements.projectById.get(req.params.projectId, req.user.id);
@@ -2699,6 +2724,116 @@ app.post("/api/admin/password", requireAuth, requireAdmin, async (req, res) => {
     res.json({ user: publicUser(req.user.id) });
   } catch (error) {
     res.status(500).json({ error: { message: error.message } });
+  }
+});
+
+app.get("/api/auth/oauth/login", (req, res) => {
+  const next = String(req.query.next || "/make");
+  const state = id("oauth");
+  res.cookie("oauth_state", state, { httpOnly: true, sameSite: "lax", signed: true, maxAge: 1000 * 60 * 10 });
+  res.cookie("oauth_next", next, { httpOnly: true, sameSite: "lax", signed: true, maxAge: 1000 * 60 * 10 });
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: oauthClientId,
+    redirect_uri: oauthCallbackUrl,
+    scope: "openid profile email",
+    state,
+  });
+  res.redirect(`${oauthAuthorizeUrl}?${params.toString()}`);
+});
+
+app.get("/api/auth/oauth/callback", async (req, res) => {
+  try {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+    const savedState = req.signedCookies?.oauth_state;
+    const next = req.signedCookies?.oauth_next || "/make";
+    res.clearCookie("oauth_state");
+    res.clearCookie("oauth_next");
+
+    if (!code) {
+      const errorMsg = req.query.error_description || req.query.error || "授权失败";
+      res.redirect(`/login?error=${encodeURIComponent(errorMsg)}`);
+      return;
+    }
+    if (!savedState || state !== savedState) {
+      res.redirect(`/login?error=${encodeURIComponent("State 验证失败，请重新登录。")}`);
+      return;
+    }
+
+    const tokenRes = await fetch(oauthTokenUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: oauthCallbackUrl,
+        client_id: oauthClientId,
+        client_secret: oauthClientSecret,
+      }),
+    });
+    const tokenData = await tokenRes.json();
+    if (tokenData.error || !tokenData.access_token) {
+      const msg = tokenData.error_description || tokenData.error || "Token 交换失败";
+      res.redirect(`/login?error=${encodeURIComponent(msg)}`);
+      return;
+    }
+
+    const userinfoRes = await fetch(oauthUserinfoUrl, {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const userinfo = await userinfoRes.json();
+    if (userinfo.error) {
+      res.redirect(`/login?error=${encodeURIComponent(userinfo.error_description || "获取用户信息失败")}`);
+      return;
+    }
+
+    const isAdmin = (userinfo.role || 0) >= 10 ? 1 : 0;
+    let user = statements.userByOAuth.get("taiji", String(userinfo.sub));
+
+    if (user) {
+      statements.updateOAuthUser.run(
+        userinfo.email || "",
+        userinfo.username || "",
+        userinfo.display_name || "",
+        isAdmin,
+        user.id,
+      );
+      user = statements.userById.get(user.id);
+    } else {
+      const oauthEmail = userinfo.email || `oauth_taiji_${userinfo.sub}@oauth.local`;
+      const existingByEmail = statements.userByEmail.get(oauthEmail);
+      const email = existingByEmail ? `oauth_taiji_${userinfo.sub}@oauth.local` : oauthEmail;
+      const result = statements.createOAuthUser.run(
+        email,
+        userinfo.username || "",
+        userinfo.display_name || "",
+        isAdmin,
+        "taiji",
+        String(userinfo.sub),
+      );
+      user = statements.userById.get(result.lastInsertRowid);
+      makeProject(user.id, "我的第一条视频链");
+    }
+
+    try {
+      const oauthProviderBase = oauthTokenUrl.replace(/\/oauth2\/token$/, "");
+      const apikeyRes = await fetch(`${oauthProviderBase}/oauth2/apikey`, {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      });
+      const apikeyData = await apikeyRes.json();
+      if (apikeyData.api_key) {
+        statements.upsertApiKey.run(user.id, encryptSecret(apikeyData.api_key), apikeyData.api_key.slice(-4));
+      }
+    } catch (_) { /* API key fetch failure should not block login */ }
+
+    const sessionId = id("session");
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 14).toISOString();
+    statements.createSession.run(sessionId, user.id, expiresAt);
+    setSessionCookie(res, sessionId, expiresAt);
+    res.redirect(next);
+  } catch (error) {
+    res.redirect(`/login?error=${encodeURIComponent(error.message)}`);
   }
 });
 

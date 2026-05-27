@@ -1000,24 +1000,27 @@ function Feature({ icon, title, text }) {
   );
 }
 
-function AuthShell({ mode, reload }) {
+function LoginPage({ reload }) {
   const navigate = useNavigate();
-  const nextPath = new URLSearchParams(window.location.search).get("next");
+  const searchParams = new URLSearchParams(window.location.search);
+  const nextPath = searchParams.get("next");
+  const oauthError = searchParams.get("error");
+  const [mode, setMode] = useState("oauth");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [error, setError] = useState("");
+  const [error, setError] = useState(oauthError || "");
   const [busy, setBusy] = useState(false);
-  const isRegister = mode === "register";
 
-  async function submit(event) {
+  const oauthLoginUrl = `/api/auth/oauth/login${nextPath ? `?next=${encodeURIComponent(nextPath)}` : ""}`;
+
+  async function handlePasswordLogin(event) {
     event.preventDefault();
     setBusy(true);
     setError("");
     try {
-      const result = await api(isRegister ? "/api/auth/register" : "/api/auth/login", {
+      const result = await api("/api/auth/login", {
         method: "POST",
-        body: JSON.stringify({ email, password, confirmPassword }),
+        body: JSON.stringify({ email, password }),
       });
       await reload();
       if (result.user?.isAdmin && result.user?.passwordResetRequired) {
@@ -1038,9 +1041,88 @@ function AuthShell({ mode, reload }) {
         <ProductLogo />
         连续视频画布
       </Link>
+      <div className="auth-card">
+        <p className="eyebrow">Welcome back</p>
+        <h1>登录工作台</h1>
+        <div className="auth-tabs">
+          <button type="button" className={mode === "oauth" ? "auth-tab active" : "auth-tab"} onClick={() => { setMode("oauth"); setError(""); }}>
+            统一账号登录
+          </button>
+          <button type="button" className={mode === "password" ? "auth-tab active" : "auth-tab"} onClick={() => { setMode("password"); setError(""); }}>
+            邮箱密码登录
+          </button>
+        </div>
+        {mode === "oauth" ? (
+          <div className="oauth-section">
+            <p className="oauth-hint">使用太极平台账号一键登录，无需单独注册。</p>
+            {error && <div className="form-error">{error}</div>}
+            <a className="full-primary oauth-btn" href={oauthLoginUrl}>
+              <ArrowRight size={16} />
+              前往统一账号登录
+            </a>
+          </div>
+        ) : (
+          <form onSubmit={handlePasswordLogin}>
+            <label>
+              邮箱
+              <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" required />
+            </label>
+            <label>
+              密码
+              <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} required />
+            </label>
+            {error && <div className="form-error">{error}</div>}
+            <button className="full-primary" type="submit" disabled={busy}>
+              {busy && <Loader2 size={16} className="spin" />}
+              登录
+            </button>
+            <p className="auth-switch">
+              还没有账号？
+              <Link to="/register">去注册</Link>
+            </p>
+          </form>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function RegisterPage({ reload }) {
+  const navigate = useNavigate();
+  const nextPath = new URLSearchParams(window.location.search).get("next");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api("/api/auth/register", {
+        method: "POST",
+        body: JSON.stringify({ email, password, confirmPassword }),
+      });
+      await reload();
+      navigate(result.user?.apiKey?.configured ? nextPath || "/make" : `/onboarding${nextPath ? `?next=${encodeURIComponent(nextPath)}` : ""}`);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="auth-page">
+      <Link className="brand auth-brand" to="/">
+        <ProductLogo />
+        连续视频画布
+      </Link>
       <form className="auth-card" onSubmit={submit}>
-        <p className="eyebrow">{isRegister ? "Create account" : "Welcome back"}</p>
-        <h1>{isRegister ? "注册新账号" : "登录工作台"}</h1>
+        <p className="eyebrow">Create account</p>
+        <h1>注册新账号</h1>
         <label>
           邮箱
           <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" required />
@@ -1049,26 +1131,24 @@ function AuthShell({ mode, reload }) {
           密码
           <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" minLength={8} required />
         </label>
-        {isRegister && (
-          <label>
-            确认密码
-            <input
-              value={confirmPassword}
-              onChange={(event) => setConfirmPassword(event.target.value)}
-              type="password"
-              minLength={8}
-              required
-            />
-          </label>
-        )}
+        <label>
+          确认密码
+          <input
+            value={confirmPassword}
+            onChange={(event) => setConfirmPassword(event.target.value)}
+            type="password"
+            minLength={8}
+            required
+          />
+        </label>
         {error && <div className="form-error">{error}</div>}
         <button className="full-primary" type="submit" disabled={busy}>
           {busy && <Loader2 size={16} className="spin" />}
-          {isRegister ? "注册并进入" : "登录"}
+          注册并进入
         </button>
         <p className="auth-switch">
-          {isRegister ? "已有账号？" : "还没有账号？"}
-          <Link to={isRegister ? "/login" : "/register"}>{isRegister ? "去登录" : "去注册"}</Link>
+          已有账号？
+          <Link to="/login">去登录</Link>
         </p>
       </form>
     </main>
@@ -1311,7 +1391,7 @@ function ProfilePage({ me, reload }) {
       <section className="profile-hero">
         <div>
           <p className="eyebrow">Account</p>
-          <h1>{me.user.email}</h1>
+          <h1>{me.user.displayName || me.user.username || me.user.email}</h1>
           <p>管理 API key，查看历史生成记录和结果。这里是排查任务、复制结果和回到画布的入口。</p>
         </div>
         <div className="profile-stats">
@@ -4973,8 +5053,8 @@ function AppRoutes() {
   return (
     <Routes>
       <Route path="/" element={<HomePage me={me} reload={me.reload} />} />
-      <Route path="/login" element={<AuthShell mode="login" reload={me.reload} />} />
-      <Route path="/register" element={<AuthShell mode="register" reload={me.reload} />} />
+      <Route path="/login" element={<LoginPage reload={me.reload} />} />
+      <Route path="/register" element={<RegisterPage reload={me.reload} />} />
       <Route path="/admin/login" element={<AdminLogin reload={me.reload} />} />
       <Route path="/admin/reset-password" element={<AdminPasswordReset me={me} reload={me.reload} />} />
       <Route path="/admin/requests" element={<RequireAdmin me={me}><AdminRequestsPage me={me} /></RequireAdmin>} />
