@@ -367,7 +367,7 @@ const statements = {
   createAdminUser: db.prepare("INSERT INTO users (email, password_hash, is_admin, must_reset_password) VALUES (?, ?, 1, 1)"),
   promoteAdminUser: db.prepare("UPDATE users SET is_admin = 1 WHERE id = ?"),
   updateUserPassword: db.prepare("UPDATE users SET password_hash = ?, must_reset_password = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"),
-  createOAuthUser: db.prepare("INSERT INTO users (email, username, display_name, is_admin, oauth_provider, oauth_provider_user_id) VALUES (?, ?, ?, ?, ?, ?)"),
+  createOAuthUser: db.prepare("INSERT INTO users (email, password_hash, username, display_name, is_admin, oauth_provider, oauth_provider_user_id) VALUES (?, '', ?, ?, ?, ?, ?)"),
   updateOAuthUser: db.prepare("UPDATE users SET email = ?, username = ?, display_name = ?, is_admin = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"),
   createSession: db.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)"),
   sessionById: db.prepare(`
